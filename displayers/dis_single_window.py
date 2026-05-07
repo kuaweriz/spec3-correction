@@ -221,11 +221,11 @@ class SingleWindowGazeCorrector:
         button_y = min(height - 94, 608)
         self._draw_button(canvas, "reading", (x0 + 28, button_y, x0 + 186, button_y + 42), "Reading Preset", reading_active)
         self._draw_button(canvas, "reset", (x0 + 202, button_y, x0 + 292, button_y + 42), "Reset", False)
-        self._draw_button(canvas, "quit", (x0 + 308, button_y, x0 + 392, button_y + 42), "Quit", False, danger=True)
+        self._draw_button(canvas, "quit", (x0 + 308, button_y, x0 + 392, button_y + 42), "Pause", False, danger=True)
 
         footer_y = min(height - 28, button_y + 78)
         calib = "on" if self.calibration_mode else "off"
-        cv2.putText(canvas, f"Keys: G on/off  R reset  C calibration ({calib})  Q quit", (x0 + 28, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (138, 147, 160), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Keys: G on/off  R reset  C calibration ({calib})  Q pause", (x0 + 28, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (138, 147, 160), 1, cv2.LINE_AA)
 
     def _draw_meter(self, panel: np.ndarray, x1: int, y: int, x2: int, value: float, label: str) -> None:
         value = max(0.0, min(value, 1.0))
