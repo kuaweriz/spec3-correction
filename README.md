@@ -1,8 +1,8 @@
-# Gaze Correction Camera
+# SpecTree
 
 **Make natural eye contact on every video call.**
 
-Gaze Correction Camera is a macOS virtual camera extension that automatically adjusts your eye direction in real-time — so you always look directly at the people you're talking to, even when you're reading notes or looking at your own video tile.
+SpecTree is a macOS camera app that automatically adjusts your eye direction in real time — so you always look directly at the people you're talking to, even when you're reading notes or looking at your own video tile.
 
 <img src="https://github.com/user-attachments/assets/66e2355a-20d7-4ac5-b711-cb1b2ff653d7" style="width: 160px; display: block;">
 
@@ -30,7 +30,7 @@ Install the `.app`, grant camera access, and you're ready to go.
 2. **Grant camera access** when prompted by macOS.
 3. **Select your camera** from the dropdown in the top-right corner of the app window.
 4. **Enable gaze correction** using the toggle in the settings panel.
-5. **Set this app as your camera** in Zoom, Teams, FaceTime, or any video app — look for **"Gaze Correction Camera"** in the camera device list.
+5. **Set this app as your camera** in Zoom, Teams, FaceTime, or any video app — look for **"SpecTree"** in the camera device list.
 
 ## Controls
 

@@ -35,7 +35,7 @@ class DisplayConfig:
 
     video_size: tuple[int, int] = (640, 480)
     face_detect_size: tuple[int, int] = (320, 240)
-    window_name: str = "Gaze Correction"
+    window_name: str = "SpecTree"
 
     @property
     def x_ratio(self) -> float:
@@ -283,7 +283,7 @@ class SingleWindowGazeCorrector:
         title_x = x0 + 28
         cv2.circle(canvas, (title_x + 6, 36), 5, accent, -1, cv2.LINE_AA)
         cv2.circle(canvas, (title_x + 6, 36), 9, (42, 72, 54), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "Gaze Studio", (title_x + 22, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.82, text, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "SpecTree", (title_x + 22, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.82, text, 2, cv2.LINE_AA)
         cv2.putText(canvas, "Live gaze control", (title_x + 24, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.43, muted, 1, cv2.LINE_AA)
 
         on_label = "ON" if tuning.enabled and self.gaze_correction_enabled else "OFF"

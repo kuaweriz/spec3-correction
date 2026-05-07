@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Single Window Gaze Correction Application
+SpecTree Camera Application
 
-A simplified gaze correction implementation using a single window.
+SpecTree gaze correction implementation using a single window.
 
 Usage:
     python bin_single_window.py                      # Use dlib backend
@@ -48,7 +48,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Single Window Gaze Correction",
+        description="SpecTree Camera",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Controls:

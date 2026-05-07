@@ -46,9 +46,9 @@
 
     NSString *home = NSHomeDirectory();
     NSString *logDir = [home stringByAppendingPathComponent:@"Library/Logs"];
-    NSString *supportDir = [[home stringByAppendingPathComponent:@"Library/Application Support"] stringByAppendingPathComponent:@"Gaze Correction Camera"];
-    self.logPath = [logDir stringByAppendingPathComponent:@"Gaze Correction Camera.log"];
-    self.cacheDir = [[home stringByAppendingPathComponent:@"Library/Caches"] stringByAppendingPathComponent:@"Gaze Correction Camera/matplotlib"];
+    NSString *supportDir = [[home stringByAppendingPathComponent:@"Library/Application Support"] stringByAppendingPathComponent:@"SpecTree"];
+    self.logPath = [logDir stringByAppendingPathComponent:@"SpecTree.log"];
+    self.cacheDir = [[home stringByAppendingPathComponent:@"Library/Caches"] stringByAppendingPathComponent:@"SpecTree/matplotlib"];
     self.controlPath = [supportDir stringByAppendingPathComponent:@"control.txt"];
 
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -64,7 +64,7 @@
         self.logHandle = [NSFileHandle fileHandleForWritingAtPath:self.logPath];
     }
     [self.logHandle seekToEndOfFile];
-    [self logLine:[NSString stringWithFormat:@"\n--- Gaze Correction Camera native start: %@ ---", [NSDate date]]];
+    [self logLine:[NSString stringWithFormat:@"\n--- SpecTree native start: %@ ---", [NSDate date]]];
 }
 
 - (void)createStatusItem {
@@ -72,9 +72,9 @@
     NSStatusBarButton *button = self.statusItem.button;
     button.image = [self statusIcon];
     button.image.template = YES;
-    button.toolTip = @"Gaze Correction Camera";
+    button.toolTip = @"SpecTree";
 
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Gaze Correction Camera"];
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"SpecTree"];
     self.openItem = [[NSMenuItem alloc] initWithTitle:@"Show Window" action:@selector(showWindow:) keyEquivalent:@""];
     self.openItem.target = self;
     [menu addItem:self.openItem];
@@ -140,7 +140,7 @@
 
     if (status != AVAuthorizationStatusAuthorized) {
         [self showAlert:@"Camera access is blocked"
-                message:@"Open System Settings > Privacy & Security > Camera and allow Gaze Correction Camera, then open it again from the menu bar icon."];
+                message:@"Open System Settings > Privacy & Security > Camera and allow SpecTree, then open it again from the menu bar icon."];
         return NO;
     }
     return YES;
@@ -193,7 +193,7 @@
     } @catch (NSException *exception) {
         NSString *message = [NSString stringWithFormat:@"Could not launch Python runtime: %@", [exception reason]];
         [self logLine:message];
-        [self showAlert:@"Gaze Correction Camera could not start" message:message];
+        [self showAlert:@"SpecTree could not start" message:message];
         self.task = nil;
         [self enterMenuBarMode];
     }
@@ -253,8 +253,8 @@
     [self enterMenuBarMode];
 
     if (!expectedExit) {
-        [self showAlert:@"Gaze Correction Camera could not start"
-                message:@"Check the log at ~/Library/Logs/Gaze Correction Camera.log. The app will stay in the menu bar so you can try opening it again."];
+        [self showAlert:@"SpecTree could not start"
+                message:@"Check the log at ~/Library/Logs/SpecTree.log. The app will stay in the menu bar so you can try opening it again."];
     }
 }
 

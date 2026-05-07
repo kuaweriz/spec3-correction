@@ -10,10 +10,12 @@ import subprocess
 from pathlib import Path
 
 
-APP_NAME = "Gaze Correction Camera"
-STOP_APP_NAME = "Stop Gaze Correction Camera"
-BUNDLE_ID = "local.gaze-correction-camera"
-STOP_BUNDLE_ID = "local.stop-gaze-correction-camera"
+APP_NAME = "SpecTree"
+STOP_APP_NAME = "Stop SpecTree"
+BUNDLE_ID = "local.spectree"
+STOP_BUNDLE_ID = "local.stop-spectree"
+LEGACY_APP_NAMES = ("Gaze Correction Camera",)
+LEGACY_STOP_APP_NAMES = ("Stop Gaze Correction Camera",)
 
 
 def make_icon_png(path: Path, size: int) -> None:
@@ -124,7 +126,7 @@ def write_info_plist(contents_dir: Path) -> None:
         "LSMinimumSystemVersion": "14.0",
         "LSArchitecturePriority": ["arm64"],
         "LSRequiresNativeExecution": True,
-        "NSCameraUsageDescription": "Camera access is needed to correct gaze in real time.",
+        "NSCameraUsageDescription": "Camera access is needed for SpecTree to correct gaze in real time.",
         "NSDesktopFolderUsageDescription": "Desktop access is only needed when loading this local app bundle.",
     }
     with (contents_dir / "Info.plist").open("wb") as f:
@@ -205,6 +207,14 @@ def main() -> None:
         shutil.rmtree(app_dir)
     if stop_app_dir.exists():
         shutil.rmtree(stop_app_dir)
+    for legacy_name in LEGACY_APP_NAMES:
+        legacy_dir = desktop_dir / f"{legacy_name}.app"
+        if legacy_dir.exists():
+            shutil.rmtree(legacy_dir)
+    for legacy_name in LEGACY_STOP_APP_NAMES:
+        legacy_dir = desktop_dir / f"{legacy_name}.app"
+        if legacy_dir.exists():
+            shutil.rmtree(legacy_dir)
 
     macos_dir.mkdir(parents=True)
     resources_dir.mkdir(parents=True)
