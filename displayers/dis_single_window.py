@@ -9,6 +9,7 @@ A simplified gaze correction application that:
 - Calibration mode for camera offset adjustment
 """
 
+import os
 import cv2
 import numpy as np
 from dataclasses import dataclass
@@ -125,6 +126,10 @@ class SingleWindowGazeCorrector:
         self.preview_max_size = (1280, 720)
         self._panel_origin_x = 0
         self._last_canvas_size: tuple[int, int] | None = None
+        self.window_visible = True
+        self._window_created = False
+        self.control_file_path = os.environ.get("GAZE_CONTROL_FILE")
+        self._last_control_mtime = 0.0
 
         # Store default values for reset
         self.default_camera_offset = self.gaze_corrector.get_camera_offset()
@@ -134,12 +139,70 @@ class SingleWindowGazeCorrector:
         """Create the single application window with camera and controls."""
         cv2.namedWindow(self.display_cfg.window_name, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(self.display_cfg.window_name, self.handle_settings_mouse)
+        self.window_visible = True
+        self._window_created = True
 
     def apply_settings_panel(self) -> None:
         """Kept for compatibility with older app loops."""
 
     def draw_settings_panel(self) -> None:
         """Kept for compatibility; the panel is now drawn into the main canvas."""
+
+    def show_window(self) -> None:
+        """Show or recreate the camera window while keeping the camera process alive."""
+        if not self._window_created:
+            self.create_settings_panel()
+        self.window_visible = True
+        self._last_canvas_size = None
+
+    def hide_window(self, already_closed: bool = False) -> None:
+        """Hide the camera window but keep capture/model processing alive."""
+        self.window_visible = False
+        self._window_created = False
+        self._last_canvas_size = None
+        self._dragging_control = None
+        self._slider_regions.clear()
+        self._button_regions.clear()
+        if not already_closed:
+            try:
+                cv2.destroyWindow(self.display_cfg.window_name)
+            except cv2.error:
+                pass
+
+    def set_correction_enabled(self, enabled: bool) -> None:
+        self.gaze_correction_enabled = enabled
+        self.gaze_corrector.set_tuning(enabled=enabled)
+
+    def process_control_command(self) -> None:
+        """Handle menu-bar commands written by the native macOS launcher."""
+        if not self.control_file_path:
+            return
+        try:
+            mtime = os.path.getmtime(self.control_file_path)
+        except OSError:
+            return
+        if mtime <= self._last_control_mtime:
+            return
+        self._last_control_mtime = mtime
+
+        try:
+            with open(self.control_file_path, "r", encoding="utf-8") as f:
+                command = f.readline().strip().lower()
+        except OSError:
+            return
+
+        if command == "show":
+            self.show_window()
+        elif command == "hide":
+            self.hide_window()
+        elif command == "enable":
+            self.set_correction_enabled(True)
+        elif command == "disable":
+            self.set_correction_enabled(False)
+        elif command == "toggle":
+            self.toggle_correction()
+        elif command == "quit":
+            self.request_quit()
 
     def compose_app_frame(self, frame: np.ndarray) -> np.ndarray:
         """Compose the camera preview and the control panel into one window."""
@@ -221,11 +284,11 @@ class SingleWindowGazeCorrector:
         button_y = min(height - 94, 608)
         self._draw_button(canvas, "reading", (x0 + 28, button_y, x0 + 186, button_y + 42), "Reading Preset", reading_active)
         self._draw_button(canvas, "reset", (x0 + 202, button_y, x0 + 292, button_y + 42), "Reset", False)
-        self._draw_button(canvas, "quit", (x0 + 308, button_y, x0 + 392, button_y + 42), "Pause", False, danger=True)
+        self._draw_button(canvas, "quit", (x0 + 308, button_y, x0 + 392, button_y + 42), "Hide", False, danger=True)
 
         footer_y = min(height - 28, button_y + 78)
         calib = "on" if self.calibration_mode else "off"
-        cv2.putText(canvas, f"Keys: G on/off  R reset  C calibration ({calib})  Q pause", (x0 + 28, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (138, 147, 160), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Keys: G on/off  R reset  C calibration ({calib})  Q hide", (x0 + 28, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (138, 147, 160), 1, cv2.LINE_AA)
 
     def _draw_meter(self, panel: np.ndarray, x1: int, y: int, x2: int, value: float, label: str) -> None:
         value = max(0.0, min(value, 1.0))
@@ -325,7 +388,7 @@ class SingleWindowGazeCorrector:
             self.gaze_correction_enabled = not self.gaze_correction_enabled
             self.gaze_corrector.set_tuning(enabled=self.gaze_correction_enabled)
         elif key == "quit":
-            self.request_quit()
+            self.hide_window()
             return
         elif key == "reading":
             self.gaze_corrector.set_tuning(
@@ -618,9 +681,10 @@ class SingleWindowGazeCorrector:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.display_cfg.video_size[1])
 
         self.create_settings_panel()
-        self.logger.log("Press 'g' to toggle gaze, 'c' for calibration, 'q' to quit")
+        self.logger.log("Press 'g' to toggle gaze, 'c' for calibration, 'q' to hide")
 
         while True:
+            self.process_control_command()
             if self.should_quit:
                 break
 
@@ -638,19 +702,27 @@ class SingleWindowGazeCorrector:
             if self.calibration_mode:
                 self.draw_calibration_overlay(display_frame)
 
-            app_frame = self.compose_app_frame(display_frame)
-            cv2.imshow(self.display_cfg.window_name, app_frame)
-            try:
-                if cv2.getWindowProperty(self.display_cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
-                    self.logger.log("Main window closed")
-                    break
-            except cv2.error:
-                break
+            key = -1
+            if self.window_visible:
+                if not self._window_created:
+                    self.create_settings_panel()
+                app_frame = self.compose_app_frame(display_frame)
+                cv2.imshow(self.display_cfg.window_name, app_frame)
+                try:
+                    if cv2.getWindowProperty(self.display_cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        self.logger.log("Main window hidden")
+                        self.hide_window(already_closed=True)
+                        continue
+                except cv2.error:
+                    self.hide_window(already_closed=True)
+                    continue
+                key = cv2.waitKeyEx(1)
 
-            key = cv2.waitKeyEx(1)
             key_ascii = key & 0xFF
-            if key_ascii in (ord("q"), ord("Q"), 27):
+            if key_ascii == 27:
                 break
+            elif key_ascii in (ord("q"), ord("Q")):
+                self.hide_window()
             elif key_ascii in (ord("g"), ord("G")):
                 self.toggle_correction()
                 self.logger.log(
