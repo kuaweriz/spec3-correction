@@ -272,8 +272,8 @@ class SingleWindowGazeCorrector:
         card_line = (66, 66, 78)
         muted = (158, 164, 176)
         text = (242, 245, 250)
-        accent = (102, 203, 135)
-        live_accent = (224, 157, 88)
+        accent = (43, 132, 255)
+        live_accent = (232, 178, 92)
 
         cv2.rectangle(canvas, (x0 + 1, 0), (x1, height), panel_bg, -1)
         cv2.rectangle(canvas, (x0 + 1, 0), (x1, 96), header_bg, -1)
@@ -282,7 +282,7 @@ class SingleWindowGazeCorrector:
 
         title_x = x0 + 28
         cv2.circle(canvas, (title_x + 6, 36), 5, accent, -1, cv2.LINE_AA)
-        cv2.circle(canvas, (title_x + 6, 36), 9, (42, 72, 54), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (title_x + 6, 36), 9, (54, 56, 87), 1, cv2.LINE_AA)
         cv2.putText(canvas, "SpecTree", (title_x + 22, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.82, text, 2, cv2.LINE_AA)
         cv2.putText(canvas, "Live gaze control", (title_x + 24, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.43, muted, 1, cv2.LINE_AA)
 
@@ -328,7 +328,7 @@ class SingleWindowGazeCorrector:
         cv2.putText(panel, label, (x1, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (148, 157, 170), 1, cv2.LINE_AA)
         cv2.line(panel, (x1 + 44, y - 11), (x2, y - 11), (64, 70, 84), 5, cv2.LINE_AA)
         fill_x = int((x1 + 44) + value * (x2 - (x1 + 44)))
-        cv2.line(panel, (x1 + 44, y - 11), (fill_x, y - 11), (84, 178, 130), 5, cv2.LINE_AA)
+        cv2.line(panel, (x1 + 44, y - 11), (fill_x, y - 11), (43, 132, 255), 5, cv2.LINE_AA)
 
     def reset_settings_panel(self) -> None:
         """Reset tuning sliders and saved tuning values."""
@@ -356,8 +356,8 @@ class SingleWindowGazeCorrector:
         border = (88, 96, 110)
         text_color = (243, 246, 250)
         if active:
-            color = (67, 163, 102)
-            border = (118, 215, 145)
+            color = (43, 111, 216)
+            border = (80, 164, 255)
         if danger:
             color = (82, 66, 72)
             border = (152, 104, 113)
@@ -398,9 +398,9 @@ class SingleWindowGazeCorrector:
 
         cv2.putText(panel, label, (x1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (224, 229, 238), 1, cv2.LINE_AA)
         value_text = f"{value:+.0f}{suffix}" if min_value < 0 else f"{value:.0f}{suffix}"
-        cv2.putText(panel, value_text, (x2 + 18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (142, 224, 182), 1, cv2.LINE_AA)
+        cv2.putText(panel, value_text, (x2 + 18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (91, 178, 255), 1, cv2.LINE_AA)
         cv2.line(panel, (x1, track_y), (x2, track_y), (58, 62, 72), 8, cv2.LINE_AA)
-        fill_color = (94, 191, 128)
+        fill_color = (43, 132, 255)
         if min_value < 0 < max_value:
             zero_ratio = (0.0 - min_value) / (max_value - min_value)
             zero_x = int(x1 + zero_ratio * (x2 - x1))
@@ -480,10 +480,10 @@ class SingleWindowGazeCorrector:
         tuning = self.gaze_corrector.get_tuning()
         reading_active, reading_score, effective_hold = self.gaze_corrector.get_reading_state()
         status = "GAZE ON" if self.gaze_correction_enabled and tuning.enabled else "GAZE OFF"
-        color = (0, 255, 0) if self.gaze_correction_enabled and tuning.enabled else (0, 0, 255)
+        color = (43, 132, 255) if self.gaze_correction_enabled and tuning.enabled else (0, 0, 255)
 
         mode = "READ" if reading_active else "LIVE"
-        mode_color = (88, 220, 130) if reading_active else (120, 190, 255)
+        mode_color = (43, 132, 255) if reading_active else (232, 178, 92)
 
         cv2.rectangle(frame, (10, 10), (315, 138), (0, 0, 0), -1)
         cv2.putText(
