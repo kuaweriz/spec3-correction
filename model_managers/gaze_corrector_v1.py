@@ -777,7 +777,7 @@ class GazeCorrector:
             matrix,
             (w, h),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
+            borderMode=cv2.BORDER_REFLECT_101,
         )
         return np.clip(shifted, 0.0, 1.0)
 
@@ -806,6 +806,92 @@ class GazeCorrector:
             result = self._shift_corrected_eye(result, pupil_delta)
         # Resize back to original size
         return cv2.resize(result, (eye_data.original_size[1], eye_data.original_size[0]))
+
+    def _eye_alpha_mask(self, eye_data, output_size: tuple[int, int]) -> np.ndarray:
+        """Create a feathered eye-only mask to avoid rectangular DeepWarp artifacts."""
+        h, w = output_size
+        mask = np.zeros((h, w), dtype=np.float32)
+
+        if eye_data.mask_points:
+            input_h, input_w = self.model_cfg.eye_input_size
+            points = np.asarray(
+                [
+                    [
+                        float(x) * w / input_w,
+                        float(y) * h / input_h,
+                    ]
+                    for x, y in eye_data.mask_points
+                ],
+                dtype=np.float32,
+            )
+            if len(points) >= 3:
+                hull = cv2.convexHull(points.astype(np.int32))
+                cv2.fillConvexPoly(mask, hull, 1.0)
+        else:
+            center = (w // 2, h // 2)
+            axes = (max(2, int(w * 0.30)), max(2, int(h * 0.20)))
+            cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+
+        if mask.max() <= 0:
+            return mask
+
+        dilate = max(2, int(min(h, w) * 0.055))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate * 2 + 1, dilate * 2 + 1)
+        )
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        blur = max(7, int(min(h, w) * 0.14) | 1)
+        mask = cv2.GaussianBlur(mask, (blur, blur), 0)
+        return np.clip(mask * 0.92, 0.0, 0.92)
+
+    def _sharpen_corrected_eye(self, image: np.ndarray) -> np.ndarray:
+        """Recover a little crispness from the low-resolution generated eye crop."""
+        img = image.astype(np.float32)
+        blurred = cv2.GaussianBlur(img, (0, 0), 0.85)
+        sharpened = cv2.addWeighted(img, 1.28, blurred, -0.28, 0)
+        return np.clip(sharpened, 0.0, 1.0)
+
+    def _blend_eye_region(self, frame: np.ndarray, eye_data, corrected_eye: np.ndarray) -> None:
+        """Blend the corrected eye through a soft eye contour mask."""
+        row, col = eye_data.top_left
+        roi_h, roi_w = eye_data.original_size
+        frame_h, frame_w = frame.shape[:2]
+
+        dst_top = max(row, 0)
+        dst_left = max(col, 0)
+        dst_bottom = min(row + roi_h, frame_h)
+        dst_right = min(col + roi_w, frame_w)
+        if dst_bottom <= dst_top or dst_right <= dst_left:
+            return
+
+        src_top = dst_top - row
+        src_left = dst_left - col
+        src_bottom = src_top + (dst_bottom - dst_top)
+        src_right = src_left + (dst_right - dst_left)
+
+        corrected = self._sharpen_corrected_eye(corrected_eye)
+        mask = self._eye_alpha_mask(eye_data, eye_data.original_size)
+
+        corrected_crop = corrected[src_top:src_bottom, src_left:src_right]
+        alpha = mask[src_top:src_bottom, src_left:src_right, None]
+        original = frame[dst_top:dst_bottom, dst_left:dst_right].astype(np.float32) / 255.0
+
+        corrected_luma = corrected_crop.mean(axis=2)
+        original_luma = original.mean(axis=2)
+        dark_artifact = np.logical_and(
+            corrected_luma < 0.035,
+            original_luma - corrected_luma > 0.16,
+        ).astype(np.float32)
+        if dark_artifact.max() > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            dark_artifact = cv2.dilate(dark_artifact, kernel, iterations=1)
+            dark_artifact = cv2.GaussianBlur(dark_artifact, (7, 7), 0)
+            alpha = alpha * (1.0 - dark_artifact[:, :, None])
+
+        blended = corrected_crop * alpha + original * (1.0 - alpha)
+        frame[dst_top:dst_bottom, dst_left:dst_right] = np.clip(
+            blended * 255.0, 0, 255
+        ).astype(np.uint8)
 
     def apply_correction(self, frame: np.ndarray, face_data, video_size: tuple[int, int]) -> np.ndarray:
         """
@@ -837,17 +923,8 @@ class GazeCorrector:
         le_corrected = self.correct_eye(le, "L", le_alpha, le_delta)
         re_corrected = self.correct_eye(re, "R", re_alpha, re_delta)
 
-        # Replace eye regions in frame (with border cropping)
-        pc = self.pixel_cut
-        frame[
-            le.top_left[0] + pc[0] : le.top_left[0] + le.original_size[0] - pc[0],
-            le.top_left[1] + pc[1] : le.top_left[1] + le.original_size[1] - pc[1],
-        ] = (le_corrected[pc[0] : -pc[0], pc[1] : -pc[1]] * 255)
-
-        frame[
-            re.top_left[0] + pc[0] : re.top_left[0] + re.original_size[0] - pc[0],
-            re.top_left[1] + pc[1] : re.top_left[1] + re.original_size[1] - pc[1],
-        ] = (re_corrected[pc[0] : -pc[0], pc[1] : -pc[1]] * 255)
+        self._blend_eye_region(frame, le, le_corrected)
+        self._blend_eye_region(frame, re, re_corrected)
 
         return frame
 

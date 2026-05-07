@@ -42,6 +42,7 @@ class EyeData:
     center: tuple[float, float]    # Eye center (x, y) in original frame
     pupil_offset: tuple[float, float] = (0.0, 0.0)
     pupil_center: Optional[tuple[float, float]] = None  # Iris center in model input pixels
+    mask_points: Optional[list[tuple[float, float]]] = None  # Eye contour in model input pixels
 
 
 @dataclass
@@ -240,6 +241,13 @@ class DlibFacePredictor(FacePredictor):
         lt_coord = (top, left)
 
         img_eye = cv2.resize(img_eye, (size_I[1], size_I[0]))
+        mask_points = [
+            (
+                (pt[0] - lt_coord[1]) * size_I[1] / ori_size[1],
+                (pt[1] - lt_coord[0]) * size_I[0] / ori_size[0],
+            )
+            for pt in points
+        ]
 
         # Create anchor maps
         ach_map = None
@@ -263,12 +271,22 @@ class DlibFacePredictor(FacePredictor):
             else:
                 ach_map = np.concatenate((ach_map, ach_map_x, ach_map_y), axis=2)
 
+        pupil_center = None
+        if eye_landmarks.pupil_center is not None:
+            pupil_center = (
+                (eye_landmarks.pupil_center[0] - lt_coord[1]) * size_I[1] / ori_size[1],
+                (eye_landmarks.pupil_center[1] - lt_coord[0]) * size_I[0] / ori_size[0],
+            )
+
         return EyeData(
             image=img_eye / 255.0,
             anchor_map=ach_map,
             original_size=ori_size,
             top_left=lt_coord,
             center=eye_landmarks.center,
+            pupil_offset=eye_landmarks.pupil_offset,
+            pupil_center=pupil_center,
+            mask_points=mask_points,
         )
 
     def list_eye_data(
@@ -513,6 +531,13 @@ class MediaPipeFacePredictor(FacePredictor):
         lt_coord = (top, left)
 
         img_eye = cv2.resize(img_eye, (size_I[1], size_I[0]))
+        mask_points = [
+            (
+                (pt[0] - lt_coord[1]) * size_I[1] / ori_size[1],
+                (pt[1] - lt_coord[0]) * size_I[0] / ori_size[0],
+            )
+            for pt in points
+        ]
 
         # Create anchor maps
         ach_map = None
@@ -551,6 +576,7 @@ class MediaPipeFacePredictor(FacePredictor):
             center=eye_landmarks.center,
             pupil_offset=eye_landmarks.pupil_offset,
             pupil_center=pupil_center,
+            mask_points=mask_points,
         )
 
     def list_eye_data(
