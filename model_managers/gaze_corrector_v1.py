@@ -358,7 +358,7 @@ class ReadingActivityDetector:
 
         evidence, release = self._reading_evidence()
         if release > 0:
-            self.score *= 1.0 - 0.58 * release
+            self.score *= 1.0 - 0.82 * release
 
         rate = 0.48 if evidence >= self.score else 0.36
         self.score = float(np.clip(self.score * (1.0 - rate) + evidence * rate, 0.0, 1.0))
@@ -393,6 +393,10 @@ class ReadingActivityDetector:
         if len(significant) > 2:
             signs = np.sign(significant)
             sign_changes = int(np.sum(signs[1:] * signs[:-1] < 0))
+        positive_motion = float(np.sum(significant[significant > 0.0])) if len(significant) else 0.0
+        negative_motion = float(np.sum(np.abs(significant[significant < 0.0]))) if len(significant) else 0.0
+        bidirectional_motion = min(positive_motion, negative_motion)
+        bidirectional_ratio = bidirectional_motion / max(total_horizontal_motion, 1e-6)
 
         recent = dx[-min(7, len(dx)) :]
         recent_abs = float(np.sum(np.abs(recent)))
@@ -405,34 +409,59 @@ class ReadingActivityDetector:
             recent_changes = int(np.sum(signs[1:] * signs[:-1] < 0))
 
         max_step = float(np.max(abs_dx)) if len(abs_dx) else 0.0
+        net_horizontal_motion = float(abs(points[-1, 0] - points[0, 0]))
+        path_direct_ratio = net_horizontal_motion / max(total_horizontal_motion, 1e-6)
         directed_glance = (
-            max_step > 0.075
-            and small_step_count <= 2
-            and recent_abs > 0.050
-            and direct_ratio > 0.80
-            and recent_changes == 0
+            (
+                max_step > 0.075
+                and small_step_count <= 3
+                and recent_abs > 0.040
+            )
+            or (
+                recent_abs > 0.050
+                and direct_ratio > 0.78
+                and recent_changes == 0
+            )
+            or (
+                total_horizontal_motion > 0.070
+                and path_direct_ratio > 0.68
+                and sign_changes <= 1
+            )
+        )
+        alternating_motion = (
+            sign_changes >= 2
+            and bidirectional_ratio > 0.16
+            and small_step_count >= 4
+        ) or (
+            recent_changes >= 2
+            and bidirectional_ratio > 0.12
+            and small_step_count >= 3
         )
 
         step_score = np.clip((small_step_count - 2.0) / 7.0, 0.0, 1.0)
         horizontal_score = np.clip((total_horizontal_motion - 0.018) / 0.14, 0.0, 1.0)
         range_score = np.clip((x_range - 0.015) / 0.16, 0.0, 1.0)
-        return_score = np.clip(sign_changes / 3.0, 0.0, 1.0)
+        return_score = np.clip((sign_changes - 1.0) / 3.0, 0.0, 1.0)
+        bidirectional_score = np.clip((bidirectional_ratio - 0.10) / 0.24, 0.0, 1.0)
         dominance = horizontal_motion / max(vertical_motion, 0.003)
         dominance_score = np.clip((dominance - 1.1) / 3.0, 0.0, 1.0)
         vertical_penalty = np.clip((vertical_motion - 0.014) / 0.055, 0.0, 1.0)
         drift_penalty = np.clip((y_range - 0.18) / 0.25, 0.0, 1.0)
 
         evidence = (
-            step_score * 0.40
-            + horizontal_score * 0.24
-            + range_score * 0.16
-            + return_score * 0.10
-            + dominance_score * 0.10
+            step_score * 0.28
+            + horizontal_score * 0.18
+            + range_score * 0.12
+            + return_score * 0.20
+            + bidirectional_score * 0.14
+            + dominance_score * 0.08
             - vertical_penalty * 0.16
             - drift_penalty * 0.10
         )
+        if not alternating_motion:
+            evidence *= 0.24
         if directed_glance:
-            evidence *= 0.18
+            evidence *= 0.08
 
         release = 1.0 if directed_glance else 0.0
         return float(np.clip(evidence, 0.0, 1.0)), release
