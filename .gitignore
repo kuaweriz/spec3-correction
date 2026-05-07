@@ -1,0 +1,20 @@
+# Heavy data: stored on the cloud for efficient development
+.venv/
+weights/
+lm_feat/
+models/
+lm_feat.zip
+weights.zip
+*.app/
+dist/
+build/
+.DS_Store
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+**/__pycache__/
+
+# User settings database
+user_settings.db
+*.log
