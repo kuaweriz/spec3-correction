@@ -618,6 +618,8 @@ class GazeCorrector:
         self.last_reading_active = False
         self.last_reading_score = 0.0
         self.last_effective_hold = 0.0
+        self.prev_face_motion: tuple[float, float, float, float] | None = None
+        self.motion_guard_until = 0.0
 
     def _load_camera_settings(self) -> CameraUserSetting:
         """Load camera settings from database or return defaults."""
@@ -759,6 +761,8 @@ class GazeCorrector:
         self.last_reading_active = False
         self.last_reading_score = 0.0
         self.last_effective_hold = 0.0
+        self.prev_face_motion = None
+        self.motion_guard_until = 0.0
 
     def set_stabilization_enabled(self, enabled: bool) -> None:
         """Enable or disable gaze stabilization at runtime."""
@@ -929,6 +933,37 @@ class GazeCorrector:
         self.last_reading_score = score
         self.last_effective_hold = hold
         return hold
+
+    def _face_motion_guard_active(self, le, re) -> bool:
+        """Suppress reading hold during quick head/face movement."""
+        now = time.monotonic()
+        center_x = (le.center[0] + re.center[0]) * 0.5
+        center_y = (le.center[1] + re.center[1]) * 0.5
+        ipd = max(
+            float(np.hypot(le.center[0] - re.center[0], le.center[1] - re.center[1])),
+            1.0,
+        )
+
+        previous = self.prev_face_motion
+        self.prev_face_motion = (center_x, center_y, ipd, now)
+        if previous is None:
+            return False
+
+        prev_x, prev_y, prev_ipd, prev_time = previous
+        dt = max(now - prev_time, 1.0 / 120.0)
+        motion = float(np.hypot(center_x - prev_x, center_y - prev_y)) / ipd
+        scale_motion = abs(ipd - prev_ipd) / max(prev_ipd, 1.0)
+        speed = motion / dt
+        scale_speed = scale_motion / dt
+
+        if motion > 0.070 or speed > 2.6 or scale_motion > 0.055 or scale_speed > 1.35:
+            self.motion_guard_until = now + 0.42
+            self.pupil_hold_filter.reset()
+            self.eye_output_hold_filter.reset()
+            self.reading_detector.score *= 0.25
+            self.reading_detector.active = False
+
+        return now < self.motion_guard_until
 
     def _get_pupil_delta(
         self, eye_data, eye_side: str, stabilizer: float
@@ -1147,7 +1182,12 @@ class GazeCorrector:
             self._adaptive_reading_hold(le, re, le_closed, re_closed)
             return frame
 
+        motion_guard = self._face_motion_guard_active(le, re)
         hold_strength = self._adaptive_reading_hold(le, re, le_closed, re_closed)
+        if motion_guard:
+            hold_strength = 0.0
+            self.last_reading_active = False
+            self.last_effective_hold = 0.0
         natural_scale = 1.0 - min(hold_strength, 1.0) * 0.96
 
         # Estimate gaze angle (video_size passed from outside)
