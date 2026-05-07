@@ -94,8 +94,8 @@ class GazeTuningSetting:
     strength: float = 1.0
     vertical_offset: float = 0.0
     horizontal_offset: float = 0.0
-    smoothing: float = 0.86
-    reading_stabilizer: float = 0.95
+    smoothing: float = 0.84
+    reading_stabilizer: float = 0.90
     natural_motion: float = 0.06
 
     def to_dict(self) -> dict:
@@ -118,7 +118,7 @@ class GazeTuningSetting:
             data.pop("reading_hold", None)
         data.pop("reading_x_gain", None)
         data.pop("reading_y_gain", None)
-        data.setdefault("reading_stabilizer", 0.95)
+        data.setdefault("reading_stabilizer", 0.90)
         return cls(**data)
 
 
@@ -729,6 +729,21 @@ class GazeCorrector:
             eye_side, eye_data.pupil_offset, stabilizer
         )
 
+    def _paired_pupil_deltas(self, le, re) -> tuple[np.ndarray, np.ndarray]:
+        """Use one binocular stabilization signal so both pupils stay aligned."""
+        stabilizer = self.tuning_settings.reading_stabilizer
+        le_delta = self._get_pupil_delta(le, "L")
+        re_delta = self._get_pupil_delta(re, "R")
+        if stabilizer <= 0:
+            return le_delta, re_delta
+
+        paired_delta = (le_delta + re_delta) * 0.5
+        pair_lock = stabilizer ** 1.8
+        return (
+            le_delta * (1.0 - pair_lock) + paired_delta * pair_lock,
+            re_delta * (1.0 - pair_lock) + paired_delta * pair_lock,
+        )
+
     def _angle_with_pupil_delta(
         self, angle: list[float], delta: np.ndarray
     ) -> list[float]:
@@ -738,74 +753,39 @@ class GazeCorrector:
 
         gain = stabilizer ** 1.35
         return [
-            angle[0] - float(delta[1]) * 75.0 * gain,
-            angle[1] - float(delta[0]) * 100.0 * gain,
+            angle[0] - float(delta[1]) * 110.0 * gain,
+            angle[1] - float(delta[0]) * 145.0 * gain,
         ]
 
-    def _warp_eye_around_pupil(
-        self,
-        image: np.ndarray,
-        pupil_center: tuple[float, float],
-        delta: np.ndarray,
-        strength_multiplier: float,
-    ) -> np.ndarray:
-        """Counter iris movement with a smooth local warp of the current eye image."""
+    def _shift_corrected_eye(self, image: np.ndarray, delta: np.ndarray) -> np.ndarray:
+        """Move the generated eye as one piece, preserving pupil/iris shape."""
         stabilizer = self.tuning_settings.reading_stabilizer
         if stabilizer <= 0:
             return image
 
         img = image.astype(np.float32)
         h, w = img.shape[:2]
-        hold_gain = (0.35 + stabilizer * 0.85) * strength_multiplier
-        eye_span_px = w * 2.0 / 3.0
-        shift_x = float(np.clip(delta[0] * eye_span_px * hold_gain, -18.0, 18.0))
-        shift_y = float(np.clip(delta[1] * eye_span_px * hold_gain, -14.0, 14.0))
-        if abs(shift_x) < 0.15 and abs(shift_y) < 0.15:
-            return img
+        shift_gain = stabilizer ** 1.45
+        shift_x = float(np.clip(-delta[0] * 24.0 * shift_gain, -6.0, 6.0))
+        shift_y = float(np.clip(-delta[1] * 18.0 * shift_gain, -4.5, 4.5))
+        if abs(shift_x) < 0.08 and abs(shift_y) < 0.08:
+            return image
 
-        current_x, current_y = pupil_center
-        target_x = float(np.clip(current_x - shift_x, 0, w - 1))
-        target_y = float(np.clip(current_y - shift_y, 0, h - 1))
-
-        grid_x, grid_y = np.meshgrid(
-            np.arange(w, dtype=np.float32),
-            np.arange(h, dtype=np.float32),
-        )
-        sigma_x = max(w * 0.23, 6.0)
-        sigma_y = max(h * 0.20, 5.0)
-        weight = np.exp(
-            -(
-                ((grid_x - target_x) ** 2) / (2.0 * sigma_x * sigma_x)
-                + ((grid_y - target_y) ** 2) / (2.0 * sigma_y * sigma_y)
-            )
-        ).astype(np.float32)
-
-        map_x = grid_x + shift_x * weight
-        map_y = grid_y + shift_y * weight
-        stabilized = cv2.remap(
+        matrix = np.asarray([[1.0, 0.0, shift_x], [0.0, 1.0, shift_y]], dtype=np.float32)
+        shifted = cv2.warpAffine(
             img,
-            map_x,
-            map_y,
-            interpolation=cv2.INTER_LINEAR,
+            matrix,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE,
         )
-        return np.clip(stabilized, 0.0, 1.0)
-
-    def _stabilize_eye_input(self, eye_data, delta: np.ndarray) -> np.ndarray:
-        """Move the current iris toward the held target before model inference."""
-        if eye_data.pupil_center is None:
-            return eye_data.image
-
-        return self._warp_eye_around_pupil(
-            eye_data.image, eye_data.pupil_center, delta, strength_multiplier=1.0
-        )
+        return np.clip(shifted, 0.0, 1.0)
 
     def correct_eye(
         self,
         eye_data,
         eye_side: str,
         angle: list[float],
-        input_image: np.ndarray | None = None,
         pupil_delta: np.ndarray | None = None,
     ) -> np.ndarray:
         """
@@ -819,14 +799,11 @@ class GazeCorrector:
         Returns:
             Corrected eye image resized to original size
         """
-        img = input_image if input_image is not None else eye_data.image
         result = self.model.infer_eye(
-            eye_side, img, eye_data.anchor_map, angle
+            eye_side, eye_data.image, eye_data.anchor_map, angle
         )
-        if pupil_delta is not None and eye_data.pupil_center is not None:
-            result = self._warp_eye_around_pupil(
-                result, eye_data.pupil_center, pupil_delta, strength_multiplier=0.38
-            )
+        if pupil_delta is not None:
+            result = self._shift_corrected_eye(result, pupil_delta)
         # Resize back to original size
         return cv2.resize(result, (eye_data.original_size[1], eye_data.original_size[0]))
 
@@ -852,16 +829,13 @@ class GazeCorrector:
 
         # Estimate gaze angle (video_size passed from outside)
         alpha, _ = self.estimate_gaze_angle(le.center, re.center, video_size)
-        le_delta = self._get_pupil_delta(le, "L")
-        re_delta = self._get_pupil_delta(re, "R")
+        le_delta, re_delta = self._paired_pupil_deltas(le, re)
         le_alpha = self._angle_with_pupil_delta(alpha, le_delta)
         re_alpha = self._angle_with_pupil_delta(alpha, re_delta)
-        le_input = self._stabilize_eye_input(le, le_delta)
-        re_input = self._stabilize_eye_input(re, re_delta)
 
         # Correct both eyes
-        le_corrected = self.correct_eye(le, "L", le_alpha, le_input, le_delta)
-        re_corrected = self.correct_eye(re, "R", re_alpha, re_input, re_delta)
+        le_corrected = self.correct_eye(le, "L", le_alpha, le_delta)
+        re_corrected = self.correct_eye(re, "R", re_alpha, re_delta)
 
         # Replace eye regions in frame (with border cropping)
         pc = self.pixel_cut
