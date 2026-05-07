@@ -130,6 +130,8 @@ class SingleWindowGazeCorrector:
         self._window_created = False
         self.control_file_path = os.environ.get("GAZE_CONTROL_FILE")
         self._last_control_mtime = 0.0
+        self._pending_hide_window = False
+        self._pending_show_window = False
 
         # Store default values for reset
         self.default_camera_offset = self.gaze_corrector.get_camera_offset()
@@ -147,6 +149,23 @@ class SingleWindowGazeCorrector:
 
     def draw_settings_panel(self) -> None:
         """Kept for compatibility; the panel is now drawn into the main canvas."""
+
+    def request_show_window(self) -> None:
+        self._pending_show_window = True
+        self._pending_hide_window = False
+
+    def request_hide_window(self) -> None:
+        self._pending_hide_window = True
+        self._pending_show_window = False
+
+    def apply_pending_window_actions(self) -> None:
+        """Run window create/destroy outside OpenCV mouse callbacks."""
+        if self._pending_hide_window:
+            self._pending_hide_window = False
+            self.hide_window()
+        if self._pending_show_window:
+            self._pending_show_window = False
+            self.show_window()
 
     def show_window(self) -> None:
         """Show or recreate the camera window while keeping the camera process alive."""
@@ -166,6 +185,7 @@ class SingleWindowGazeCorrector:
         if not already_closed:
             try:
                 cv2.destroyWindow(self.display_cfg.window_name)
+                cv2.waitKey(1)
             except cv2.error:
                 pass
 
@@ -192,9 +212,9 @@ class SingleWindowGazeCorrector:
             return
 
         if command == "show":
-            self.show_window()
+            self.request_show_window()
         elif command == "hide":
-            self.hide_window()
+            self.request_hide_window()
         elif command == "enable":
             self.set_correction_enabled(True)
         elif command == "disable":
@@ -388,7 +408,7 @@ class SingleWindowGazeCorrector:
             self.gaze_correction_enabled = not self.gaze_correction_enabled
             self.gaze_corrector.set_tuning(enabled=self.gaze_correction_enabled)
         elif key == "quit":
-            self.hide_window()
+            self.request_hide_window()
             return
         elif key == "reading":
             self.gaze_corrector.set_tuning(
@@ -685,6 +705,7 @@ class SingleWindowGazeCorrector:
 
         while True:
             self.process_control_command()
+            self.apply_pending_window_actions()
             if self.should_quit:
                 break
 
@@ -722,7 +743,7 @@ class SingleWindowGazeCorrector:
             if key_ascii == 27:
                 break
             elif key_ascii in (ord("q"), ord("Q")):
-                self.hide_window()
+                self.request_hide_window()
             elif key_ascii in (ord("g"), ord("G")):
                 self.toggle_correction()
                 self.logger.log(
