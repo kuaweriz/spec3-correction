@@ -24,6 +24,7 @@ class EyeLandmarks:
     points: list[tuple[int, int]]  # 6 points for each eye
     center: tuple[float, float]  # Eye center (x, y)
     pupil_offset: tuple[float, float] = (0.0, 0.0)  # normalized iris offset from eye center
+    pupil_center: Optional[tuple[float, float]] = None  # Iris center (x, y) in original frame
 
 
 @dataclass
@@ -40,6 +41,7 @@ class EyeData:
     top_left: tuple[int, int]      # (row, col) position in original frame
     center: tuple[float, float]    # Eye center (x, y) in original frame
     pupil_offset: tuple[float, float] = (0.0, 0.0)
+    pupil_center: Optional[tuple[float, float]] = None  # Iris center in model input pixels
 
 
 @dataclass
@@ -398,6 +400,9 @@ class MediaPipeFacePredictor(FacePredictor):
             pupil_offset=self._compute_pupil_offset(
                 landmarks, self.LEFT_IRIS_INDICES, self.LEFT_EYE_CORNERS, w, h
             ),
+            pupil_center=self._compute_iris_center(
+                landmarks, self.LEFT_IRIS_INDICES, w, h
+            ),
         )
 
         # Extract right eye landmarks
@@ -414,6 +419,9 @@ class MediaPipeFacePredictor(FacePredictor):
             center=right_center,
             pupil_offset=self._compute_pupil_offset(
                 landmarks, self.RIGHT_IRIS_INDICES, self.RIGHT_EYE_CORNERS, w, h
+            ),
+            pupil_center=self._compute_iris_center(
+                landmarks, self.RIGHT_IRIS_INDICES, w, h
             ),
         )
 
@@ -438,6 +446,17 @@ class MediaPipeFacePredictor(FacePredictor):
         return (
             max(-1.0, min((iris_x - center_x) / eye_width, 1.0)),
             max(-1.0, min((iris_y - center_y) / eye_width, 1.0)),
+        )
+
+    def _compute_iris_center(
+        self, landmarks, iris_indices: list[int], w: int, h: int
+    ) -> Optional[tuple[float, float]]:
+        if len(landmarks) <= max(iris_indices):
+            return None
+
+        return (
+            sum(landmarks[i].x * w for i in iris_indices) / len(iris_indices),
+            sum(landmarks[i].y * h for i in iris_indices) / len(iris_indices),
         )
 
     def _extract_eye_data(
@@ -517,6 +536,13 @@ class MediaPipeFacePredictor(FacePredictor):
             else:
                 ach_map = np.concatenate((ach_map, ach_map_x, ach_map_y), axis=2)
 
+        pupil_center = None
+        if eye_landmarks.pupil_center is not None:
+            pupil_center = (
+                (eye_landmarks.pupil_center[0] - lt_coord[1]) * size_I[1] / ori_size[1],
+                (eye_landmarks.pupil_center[1] - lt_coord[0]) * size_I[0] / ori_size[0],
+            )
+
         return EyeData(
             image=img_eye / 255.0,
             anchor_map=ach_map,
@@ -524,6 +550,7 @@ class MediaPipeFacePredictor(FacePredictor):
             top_left=lt_coord,
             center=eye_landmarks.center,
             pupil_offset=eye_landmarks.pupil_offset,
+            pupil_center=pupil_center,
         )
 
     def list_eye_data(

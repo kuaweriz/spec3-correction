@@ -149,6 +149,7 @@ class SingleWindowGazeCorrector:
         cv2.putText(panel, "Simple controls for stable, natural eye contact", (30, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 166, 176), 1, cv2.LINE_AA)
 
         self._draw_button(panel, "toggle", (420, 24, 568, 62), "ON" if tuning.enabled else "OFF", tuning.enabled)
+        self._draw_button(panel, "quit", (420, 440, 568, 480), "Quit", False, danger=True)
         self._draw_button(panel, "reset", (420, 490, 568, 530), "Reset", False)
 
         sliders = [
@@ -156,7 +157,7 @@ class SingleWindowGazeCorrector:
             ("vertical", "Eyes Up / Down", tuning.vertical_offset, -90.0, 90.0, " deg"),
             ("horizontal", "Eyes Left / Right", tuning.horizontal_offset, -45.0, 45.0, " deg"),
             ("smooth", "Smooth", tuning.smoothing * 100.0, 0.0, 100.0, "%"),
-            ("stabilizer", "Eye Stabilizer", tuning.reading_stabilizer * 100.0, 0.0, 100.0, "%"),
+            ("stabilizer", "Pupil Hold", tuning.reading_stabilizer * 100.0, 0.0, 100.0, "%"),
             ("live", "Live Look", tuning.natural_motion * 100.0, 0.0, 100.0, "%"),
         ]
 
@@ -165,7 +166,7 @@ class SingleWindowGazeCorrector:
             self._draw_slider(panel, key, label, value, min_value, max_value, suffix, y)
             y += 58
 
-        cv2.putText(panel, "Tip: raise Eye Stabilizer and Smooth while reading text.", (30, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (168, 174, 184), 1, cv2.LINE_AA)
+        cv2.putText(panel, "Tip: raise Pupil Hold and Smooth while reading text.", (30, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (168, 174, 184), 1, cv2.LINE_AA)
         cv2.putText(panel, "Keys: G on/off  R reset  C calibration  Q quit", (30, 518), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (168, 174, 184), 1, cv2.LINE_AA)
         cv2.imshow(self.settings_window_name, panel)
 
@@ -190,9 +191,14 @@ class SingleWindowGazeCorrector:
         rect: tuple[int, int, int, int],
         label: str,
         active: bool,
+        danger: bool = False,
     ) -> None:
         x1, y1, x2, y2 = rect
-        color = (68, 174, 118) if active else (58, 63, 73)
+        color = (78, 89, 108)
+        if active:
+            color = (68, 174, 118)
+        if danger:
+            color = (170, 79, 88)
         cv2.rectangle(panel, (x1, y1), (x2, y2), color, -1)
         cv2.rectangle(panel, (x1, y1), (x2, y2), (92, 99, 112), 1)
         text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0]
@@ -254,6 +260,9 @@ class SingleWindowGazeCorrector:
         if key == "toggle":
             self.gaze_correction_enabled = not self.gaze_correction_enabled
             self.gaze_corrector.set_tuning(enabled=self.gaze_correction_enabled)
+        elif key == "quit":
+            self.request_quit()
+            return
         elif key == "reset":
             self.reset_settings_panel()
             return
