@@ -279,6 +279,40 @@ class PupilHoldFilter:
         return delta
 
 
+class EyeOutputHoldFilter:
+    """Temporally holds the generated eye crop so reading saccades do not leak out."""
+
+    def __init__(self):
+        self.previous: dict[str, np.ndarray] = {}
+
+    def reset(self) -> None:
+        self.previous.clear()
+
+    def apply(self, eye_side: str, image: np.ndarray, hold_strength: float) -> np.ndarray:
+        if hold_strength <= 0:
+            self.previous[eye_side] = image.astype(np.float32)
+            return image
+
+        current = image.astype(np.float32)
+        previous = self.previous.get(eye_side)
+        if previous is None or previous.shape != current.shape:
+            self.previous[eye_side] = current
+            return current
+
+        diff = float(np.mean(np.abs(current - previous)))
+
+        # High reading hold means the generated eye should barely update frame-to-frame.
+        alpha = 0.006 + 0.28 * ((1.0 - hold_strength) ** 2.0)
+        if diff > 0.24:
+            alpha = max(alpha, 0.22)
+        elif diff > 0.16:
+            alpha = max(alpha, 0.06)
+
+        held = previous * (1.0 - alpha) + current * alpha
+        self.previous[eye_side] = held
+        return held
+
+
 ################################################################################
 # Gaze Correction Model
 ################################################################################
@@ -450,6 +484,7 @@ class GazeCorrector:
         self.stabilization_cfg = GazeStabilizationConfig()
         self.gaze_filter = OneEuroVectorFilter(self.stabilization_cfg)
         self.pupil_hold_filter = PupilHoldFilter()
+        self.eye_output_hold_filter = EyeOutputHoldFilter()
         self._apply_tuning_to_filter()
 
         # Last estimated eye position (for visualization)
@@ -590,6 +625,7 @@ class GazeCorrector:
         """Reset temporal state after face/eye tracking is lost."""
         self.gaze_filter.reset()
         self.pupil_hold_filter.reset()
+        self.eye_output_hold_filter.reset()
 
     def set_stabilization_enabled(self, enabled: bool) -> None:
         """Enable or disable gaze stabilization at runtime."""
@@ -614,6 +650,19 @@ class GazeCorrector:
         save: bool = True,
     ) -> None:
         """Update manual gaze tuning controls."""
+        should_reset_temporal_state = any(
+            value is not None
+            for value in (
+                enabled,
+                strength,
+                vertical_offset,
+                horizontal_offset,
+                smoothing,
+                reading_stabilizer,
+                natural_motion,
+            )
+        )
+
         if enabled is not None:
             self.tuning_settings.enabled = enabled
         if strength is not None:
@@ -630,6 +679,8 @@ class GazeCorrector:
             self.tuning_settings.natural_motion = max(0.0, min(natural_motion, 1.0))
 
         self._apply_tuning_to_filter()
+        if should_reset_temporal_state:
+            self.reset_tracking()
         if save:
             self.save_tuning_settings()
 
@@ -638,7 +689,7 @@ class GazeCorrector:
         self.tuning_settings = GazeTuningSetting()
         self._apply_tuning_to_filter()
         self.save_tuning_settings()
-        self.gaze_filter.reset()
+        self.reset_tracking()
 
     def _apply_tuning_to_filter(self) -> None:
         """Map simple UI smoothing controls to filter parameters."""
@@ -804,6 +855,9 @@ class GazeCorrector:
         )
         if pupil_delta is not None:
             result = self._shift_corrected_eye(result, pupil_delta)
+        result = self.eye_output_hold_filter.apply(
+            eye_side, result, self.tuning_settings.reading_stabilizer
+        )
         # Resize back to original size
         return cv2.resize(result, (eye_data.original_size[1], eye_data.original_size[0]))
 
