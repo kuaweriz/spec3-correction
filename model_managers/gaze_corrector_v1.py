@@ -298,7 +298,7 @@ class EyeOutputHoldFilter:
         self.previous.pop(eye_side, None)
 
     def apply(self, eye_side: str, image: np.ndarray, hold_strength: float) -> np.ndarray:
-        if hold_strength <= 0:
+        if hold_strength <= 0.08:
             self.previous[eye_side] = image.astype(np.float32)
             return image
 
@@ -311,7 +311,7 @@ class EyeOutputHoldFilter:
         diff = float(np.mean(np.abs(current - previous)))
 
         # High reading hold means the generated eye should barely update frame-to-frame.
-        alpha = 0.006 + 0.28 * ((1.0 - hold_strength) ** 2.0)
+        alpha = 0.008 + 0.34 * ((1.0 - hold_strength) ** 2.0)
         if diff > 0.24:
             alpha = max(alpha, 0.22)
         elif diff > 0.16:
@@ -326,7 +326,7 @@ class ReadingActivityDetector:
     """Classifies reading from short-term iris motion patterns."""
 
     def __init__(self):
-        self.history: deque[tuple[float, np.ndarray]] = deque(maxlen=90)
+        self.history: deque[tuple[float, np.ndarray]] = deque(maxlen=70)
         self.score = 0.0
         self.active = False
 
@@ -342,8 +342,8 @@ class ReadingActivityDetector:
         eyes_closed: bool,
     ) -> tuple[bool, float]:
         if eyes_closed:
-            self.score *= 0.82
-            self.active = self.score > 0.42
+            self.score *= 0.70
+            self.active = self.score > 0.32
             return self.active, self.score
 
         now = time.monotonic()
@@ -353,21 +353,25 @@ class ReadingActivityDetector:
         ) * 0.5
         self.history.append((now, point))
 
-        while self.history and now - self.history[0][0] > 1.45:
+        while self.history and now - self.history[0][0] > 0.95:
             self.history.popleft()
 
-        evidence = self._reading_evidence()
-        self.score = float(np.clip(self.score * 0.88 + evidence * 0.12, 0.0, 1.0))
+        evidence, release = self._reading_evidence()
+        if release > 0:
+            self.score *= 1.0 - 0.72 * release
+
+        rate = 0.34 if evidence >= self.score else 0.30
+        self.score = float(np.clip(self.score * (1.0 - rate) + evidence * rate, 0.0, 1.0))
 
         if self.active:
-            self.active = self.score > 0.34
+            self.active = self.score > 0.26
         else:
-            self.active = self.score > 0.52
+            self.active = self.score > 0.40
         return self.active, self.score
 
-    def _reading_evidence(self) -> float:
-        if len(self.history) < 8:
-            return 0.0
+    def _reading_evidence(self) -> tuple[float, float]:
+        if len(self.history) < 5:
+            return 0.0, 0.0
 
         points = np.asarray([point for _, point in self.history], dtype=np.float32)
         diffs = np.diff(points, axis=0)
@@ -386,9 +390,24 @@ class ReadingActivityDetector:
             signs = np.sign(significant)
             sign_changes = int(np.sum(signs[1:] * signs[:-1] < 0))
 
+        recent = dx[-min(7, len(dx)) :]
+        recent_abs = float(np.sum(np.abs(recent)))
+        recent_net = float(abs(np.sum(recent)))
+        direct_ratio = recent_net / max(recent_abs, 1e-6)
+        recent_significant = recent[np.abs(recent) > 0.005]
+        recent_changes = 0
+        if len(recent_significant) > 2:
+            signs = np.sign(recent_significant)
+            recent_changes = int(np.sum(signs[1:] * signs[:-1] < 0))
+        directed_glance = (
+            recent_abs > 0.035
+            and direct_ratio > 0.72
+            and recent_changes == 0
+        )
+
         horizontal_score = np.clip((horizontal_motion - 0.004) / 0.025, 0.0, 1.0)
         range_score = np.clip((x_range - 0.035) / 0.22, 0.0, 1.0)
-        return_score = np.clip(sign_changes / 4.0, 0.0, 1.0)
+        return_score = np.clip(sign_changes / 3.0, 0.0, 1.0)
         vertical_penalty = np.clip((vertical_motion - 0.014) / 0.055, 0.0, 1.0)
         drift_penalty = np.clip((y_range - 0.18) / 0.25, 0.0, 1.0)
 
@@ -399,7 +418,11 @@ class ReadingActivityDetector:
             - vertical_penalty * 0.16
             - drift_penalty * 0.10
         )
-        return float(np.clip(evidence, 0.0, 1.0))
+        if directed_glance:
+            evidence *= 0.35
+
+        release = 1.0 if directed_glance else 0.0
+        return float(np.clip(evidence, 0.0, 1.0)), release
 
 
 ################################################################################
@@ -880,11 +903,15 @@ class GazeCorrector:
             le_closed or re_closed,
         )
         if active:
-            intensity = np.clip((score - 0.24) / 0.56, 0.0, 1.0)
+            intensity = np.clip((score - 0.18) / 0.48, 0.0, 1.0)
         else:
-            intensity = np.clip(score / 0.60, 0.0, 0.55)
+            intensity = np.clip((score - 0.24) / 0.42, 0.0, 0.28)
 
         hold = float(self.tuning_settings.reading_stabilizer * intensity)
+        if hold < 0.08:
+            hold = 0.0
+            self.pupil_hold_filter.reset()
+            self.eye_output_hold_filter.reset()
         self.last_reading_active = active
         self.last_reading_score = score
         self.last_effective_hold = hold
