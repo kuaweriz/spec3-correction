@@ -23,6 +23,7 @@ class EyeLandmarks:
 
     points: list[tuple[int, int]]  # 6 points for each eye
     center: tuple[float, float]  # Eye center (x, y)
+    openness: float = 1.0  # Eye aspect ratio, lower means more closed
     pupil_offset: tuple[float, float] = (0.0, 0.0)  # normalized iris offset from eye center
     pupil_center: Optional[tuple[float, float]] = None  # Iris center (x, y) in original frame
 
@@ -40,6 +41,7 @@ class EyeData:
     original_size: tuple[int, int] # (height, width) before resize
     top_left: tuple[int, int]      # (row, col) position in original frame
     center: tuple[float, float]    # Eye center (x, y) in original frame
+    openness: float = 1.0          # Eye aspect ratio, lower means more closed
     pupil_offset: tuple[float, float] = (0.0, 0.0)
     pupil_center: Optional[tuple[float, float]] = None  # Iris center in model input pixels
     mask_points: Optional[list[tuple[float, float]]] = None  # Eye contour in model input pixels
@@ -74,6 +76,18 @@ class EyeExtractionConfig:
 
     input_size: tuple[int, int] = (48, 64)  # (height, width) for model input
     ef_dim: int = 12  # Feature dimension (6 points * 2 coords)
+
+
+def compute_eye_openness(points: list[tuple[int, int]]) -> float:
+    """Return eye aspect ratio from six eye contour landmarks."""
+    if len(points) < 6:
+        return 1.0
+
+    pts = np.asarray(points, dtype=np.float32)
+    eye_width = max(float(np.linalg.norm(pts[3] - pts[0])), 1.0)
+    vertical_a = float(np.linalg.norm(pts[1] - pts[5]))
+    vertical_b = float(np.linalg.norm(pts[2] - pts[4]))
+    return (vertical_a + vertical_b) / (2.0 * eye_width)
 
 
 class FacePredictor(ABC):
@@ -156,14 +170,22 @@ class DlibFacePredictor(FacePredictor):
             (shape.part(i).x, shape.part(i).y) for i in self.LEFT_EYE_INDICES
         ]
         left_center = self._compute_eye_center(shape, 42, 45)
-        left_eye = EyeLandmarks(points=left_eye_points, center=left_center)
+        left_eye = EyeLandmarks(
+            points=left_eye_points,
+            center=left_center,
+            openness=compute_eye_openness(left_eye_points),
+        )
 
         # Extract right eye landmarks (36-41)
         right_eye_points = [
             (shape.part(i).x, shape.part(i).y) for i in self.RIGHT_EYE_INDICES
         ]
         right_center = self._compute_eye_center(shape, 36, 39)
-        right_eye = EyeLandmarks(points=right_eye_points, center=right_center)
+        right_eye = EyeLandmarks(
+            points=right_eye_points,
+            center=right_center,
+            openness=compute_eye_openness(right_eye_points),
+        )
 
         return FaceLandmarks(
             left_eye=left_eye, right_eye=right_eye, raw_shape=shape
@@ -284,6 +306,7 @@ class DlibFacePredictor(FacePredictor):
             original_size=ori_size,
             top_left=lt_coord,
             center=eye_landmarks.center,
+            openness=eye_landmarks.openness,
             pupil_offset=eye_landmarks.pupil_offset,
             pupil_center=pupil_center,
             mask_points=mask_points,
@@ -415,6 +438,7 @@ class MediaPipeFacePredictor(FacePredictor):
         left_eye = EyeLandmarks(
             points=left_eye_points,
             center=left_center,
+            openness=compute_eye_openness(left_eye_points),
             pupil_offset=self._compute_pupil_offset(
                 landmarks, self.LEFT_IRIS_INDICES, self.LEFT_EYE_CORNERS, w, h
             ),
@@ -435,6 +459,7 @@ class MediaPipeFacePredictor(FacePredictor):
         right_eye = EyeLandmarks(
             points=right_eye_points,
             center=right_center,
+            openness=compute_eye_openness(right_eye_points),
             pupil_offset=self._compute_pupil_offset(
                 landmarks, self.RIGHT_IRIS_INDICES, self.RIGHT_EYE_CORNERS, w, h
             ),
@@ -574,6 +599,7 @@ class MediaPipeFacePredictor(FacePredictor):
             original_size=ori_size,
             top_left=lt_coord,
             center=eye_landmarks.center,
+            openness=eye_landmarks.openness,
             pupil_offset=eye_landmarks.pupil_offset,
             pupil_center=pupil_center,
             mask_points=mask_points,

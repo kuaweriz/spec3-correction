@@ -225,6 +225,11 @@ class PupilHoldFilter:
         self.smoothed_offsets.clear()
         self.release_scores.clear()
 
+    def reset_eye(self, eye_side: str) -> None:
+        self.stable_offsets.pop(eye_side, None)
+        self.smoothed_offsets.pop(eye_side, None)
+        self.release_scores.pop(eye_side, None)
+
     def apply(
         self,
         eye_side: str,
@@ -287,6 +292,9 @@ class EyeOutputHoldFilter:
 
     def reset(self) -> None:
         self.previous.clear()
+
+    def reset_eye(self, eye_side: str) -> None:
+        self.previous.pop(eye_side, None)
 
     def apply(self, eye_side: str, image: np.ndarray, hold_strength: float) -> np.ndarray:
         if hold_strength <= 0:
@@ -808,6 +816,14 @@ class GazeCorrector:
             angle[1] - float(delta[0]) * 145.0 * gain,
         ]
 
+    def _eye_is_closed(self, eye_data) -> bool:
+        """Detect blink/closed eye; DeepWarp must not draw an open pupil then."""
+        return float(getattr(eye_data, "openness", 1.0)) < 0.19
+
+    def _reset_eye_temporal_state(self, eye_side: str) -> None:
+        self.pupil_hold_filter.reset_eye(eye_side)
+        self.eye_output_hold_filter.reset_eye(eye_side)
+
     def _shift_corrected_eye(self, image: np.ndarray, delta: np.ndarray) -> np.ndarray:
         """Move the generated eye as one piece, preserving pupil/iris shape."""
         stabilizer = self.tuning_settings.reading_stabilizer
@@ -966,19 +982,40 @@ class GazeCorrector:
 
         le = face_data.left_eye
         re = face_data.right_eye
+        le_closed = self._eye_is_closed(le)
+        re_closed = self._eye_is_closed(re)
+
+        if le_closed:
+            self._reset_eye_temporal_state("L")
+        if re_closed:
+            self._reset_eye_temporal_state("R")
+        if le_closed and re_closed:
+            return frame
 
         # Estimate gaze angle (video_size passed from outside)
         alpha, _ = self.estimate_gaze_angle(le.center, re.center, video_size)
-        le_delta, re_delta = self._paired_pupil_deltas(le, re)
-        le_alpha = self._angle_with_pupil_delta(alpha, le_delta)
-        re_alpha = self._angle_with_pupil_delta(alpha, re_delta)
+        if not le_closed and not re_closed:
+            le_delta, re_delta = self._paired_pupil_deltas(le, re)
+        else:
+            le_delta = (
+                self._get_pupil_delta(le, "L")
+                if not le_closed
+                else np.zeros(2, dtype=np.float32)
+            )
+            re_delta = (
+                self._get_pupil_delta(re, "R")
+                if not re_closed
+                else np.zeros(2, dtype=np.float32)
+            )
 
-        # Correct both eyes
-        le_corrected = self.correct_eye(le, "L", le_alpha, le_delta)
-        re_corrected = self.correct_eye(re, "R", re_alpha, re_delta)
-
-        self._blend_eye_region(frame, le, le_corrected)
-        self._blend_eye_region(frame, re, re_corrected)
+        if not le_closed:
+            le_alpha = self._angle_with_pupil_delta(alpha, le_delta)
+            le_corrected = self.correct_eye(le, "L", le_alpha, le_delta)
+            self._blend_eye_region(frame, le, le_corrected)
+        if not re_closed:
+            re_alpha = self._angle_with_pupil_delta(alpha, re_delta)
+            re_corrected = self.correct_eye(re, "R", re_alpha, re_delta)
+            self._blend_eye_region(frame, re, re_corrected)
 
         return frame
 
