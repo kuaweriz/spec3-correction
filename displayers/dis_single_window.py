@@ -149,6 +149,7 @@ class SingleWindowGazeCorrector:
         cv2.putText(panel, "Simple controls for stable, natural eye contact", (30, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 166, 176), 1, cv2.LINE_AA)
 
         self._draw_button(panel, "toggle", (420, 24, 568, 62), "ON" if tuning.enabled else "OFF", tuning.enabled)
+        self._draw_button(panel, "reading", (420, 360, 568, 400), "Reading", False)
         self._draw_button(panel, "quit", (420, 440, 568, 480), "Quit", False, danger=True)
         self._draw_button(panel, "reset", (420, 490, 568, 530), "Reset", False)
 
@@ -166,7 +167,7 @@ class SingleWindowGazeCorrector:
             self._draw_slider(panel, key, label, value, min_value, max_value, suffix, y)
             y += 58
 
-        cv2.putText(panel, "Tip: raise Pupil Hold and Smooth while reading text.", (30, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (168, 174, 184), 1, cv2.LINE_AA)
+        cv2.putText(panel, "For reading: Live Look 0-6%, Pupil Hold 95-100%, Smooth 90-98%.", (30, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (168, 174, 184), 1, cv2.LINE_AA)
         cv2.putText(panel, "Keys: G on/off  R reset  C calibration  Q quit", (30, 518), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (168, 174, 184), 1, cv2.LINE_AA)
         cv2.imshow(self.settings_window_name, panel)
 
@@ -218,14 +219,14 @@ class SingleWindowGazeCorrector:
         suffix: str,
         y: int,
     ) -> None:
-        x1, x2 = 30, 500
+        x1, x2 = 30, 380
         track_y = y + 28
         value = max(min_value, min(value, max_value))
         ratio = 0.0 if max_value == min_value else (value - min_value) / (max_value - min_value)
         knob_x = int(x1 + ratio * (x2 - x1))
 
         cv2.putText(panel, label, (x1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 234, 240), 1, cv2.LINE_AA)
-        cv2.putText(panel, f"{value:+.0f}{suffix}" if min_value < 0 else f"{value:.0f}{suffix}", (510, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 220, 176), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"{value:+.0f}{suffix}" if min_value < 0 else f"{value:.0f}{suffix}", (395, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 220, 176), 1, cv2.LINE_AA)
         cv2.line(panel, (x1, track_y), (x2, track_y), (70, 76, 88), 8, cv2.LINE_AA)
         cv2.line(panel, (x1, track_y), (knob_x, track_y), (74, 171, 124), 8, cv2.LINE_AA)
         cv2.circle(panel, (knob_x, track_y), 11, (236, 241, 246), -1, cv2.LINE_AA)
@@ -263,6 +264,12 @@ class SingleWindowGazeCorrector:
         elif key == "quit":
             self.request_quit()
             return
+        elif key == "reading":
+            self.gaze_corrector.set_tuning(
+                smoothing=0.96,
+                reading_stabilizer=1.0,
+                natural_motion=0.02,
+            )
         elif key == "reset":
             self.reset_settings_panel()
             return
