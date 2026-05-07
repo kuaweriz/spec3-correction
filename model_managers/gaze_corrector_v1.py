@@ -949,19 +949,15 @@ class GazeCorrector:
         if previous is None:
             return False
 
-        prev_x, prev_y, prev_ipd, prev_time = previous
-        dt = max(now - prev_time, 1.0 / 120.0)
+        prev_x, prev_y, prev_ipd, _prev_time = previous
         motion = float(np.hypot(center_x - prev_x, center_y - prev_y)) / ipd
         scale_motion = abs(ipd - prev_ipd) / max(prev_ipd, 1.0)
-        speed = motion / dt
-        scale_speed = scale_motion / dt
 
-        if motion > 0.070 or speed > 2.6 or scale_motion > 0.055 or scale_speed > 1.35:
-            self.motion_guard_until = now + 0.42
+        if motion > 0.160 or scale_motion > 0.120:
+            self.motion_guard_until = now + 0.25
             self.pupil_hold_filter.reset()
             self.eye_output_hold_filter.reset()
-            self.reading_detector.score *= 0.25
-            self.reading_detector.active = False
+            self.reading_detector.history.clear()
 
         return now < self.motion_guard_until
 
