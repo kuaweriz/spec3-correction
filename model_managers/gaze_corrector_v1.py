@@ -298,7 +298,7 @@ class EyeOutputHoldFilter:
         self.previous.pop(eye_side, None)
 
     def apply(self, eye_side: str, image: np.ndarray, hold_strength: float) -> np.ndarray:
-        if hold_strength <= 0.08:
+        if hold_strength <= 0.02:
             self.previous[eye_side] = image.astype(np.float32)
             return image
 
@@ -326,14 +326,18 @@ class ReadingActivityDetector:
     """Classifies reading from short-term iris motion patterns."""
 
     def __init__(self):
-        self.history: deque[tuple[float, np.ndarray]] = deque(maxlen=70)
+        self.history: deque[tuple[float, np.ndarray]] = deque(maxlen=90)
         self.score = 0.0
         self.active = False
+        self.active_until = 0.0
+        self.release_until = 0.0
 
     def reset(self) -> None:
         self.history.clear()
         self.score = 0.0
         self.active = False
+        self.active_until = 0.0
+        self.release_until = 0.0
 
     def update(
         self,
@@ -341,39 +345,53 @@ class ReadingActivityDetector:
         right_offset: tuple[float, float],
         eyes_closed: bool,
     ) -> tuple[bool, float]:
+        now = time.monotonic()
         if eyes_closed:
-            self.score *= 0.70
-            self.active = self.score > 0.32
+            self.score *= 0.76
+            self.active = self.score > 0.24 and now < self.active_until
             return self.active, self.score
 
-        now = time.monotonic()
         point = (
             np.asarray(left_offset, dtype=np.float32)
             + np.asarray(right_offset, dtype=np.float32)
         ) * 0.5
         self.history.append((now, point))
 
-        while self.history and now - self.history[0][0] > 1.15:
+        while self.history and now - self.history[0][0] > 1.25:
             self.history.popleft()
 
-        evidence, release = self._reading_evidence()
+        evidence, release = self._reading_evidence(now)
         if release > 0:
-            self.score *= 1.0 - 0.82 * release
+            self.release_until = max(self.release_until, now + 0.24)
+            self.active_until = 0.0
+            self.score *= 1.0 - 0.72 * release
+        if now < self.release_until:
+            evidence *= 0.10
 
-        rate = 0.48 if evidence >= self.score else 0.36
+        if evidence > 0.26:
+            self.active_until = max(self.active_until, now + 0.48)
+
+        rate = 0.56 if evidence >= self.score else (0.16 if self.active else 0.30)
         self.score = float(np.clip(self.score * (1.0 - rate) + evidence * rate, 0.0, 1.0))
 
-        if self.active:
-            self.active = self.score > 0.22
+        if now < self.release_until:
+            self.active = False
+        elif self.active:
+            self.active = self.score > 0.17 or now < self.active_until
         else:
-            self.active = self.score > 0.32
+            self.active = self.score > 0.34
         return self.active, self.score
 
-    def _reading_evidence(self) -> tuple[float, float]:
+    def _reading_evidence(self, now: float) -> tuple[float, float]:
         if len(self.history) < 5:
             return 0.0, 0.0
 
-        points = np.asarray([point for _, point in self.history], dtype=np.float32)
+        window = [(t, point) for t, point in self.history if now - t <= 0.82]
+        if len(window) < 5:
+            window = list(self.history)
+
+        times = np.asarray([t for t, _point in window], dtype=np.float32)
+        points = np.asarray([point for _t, point in window], dtype=np.float32)
         diffs = np.diff(points, axis=0)
         dx = diffs[:, 0]
         dy = diffs[:, 1]
@@ -385,8 +403,16 @@ class ReadingActivityDetector:
         x_range = float(np.percentile(points[:, 0], 90) - np.percentile(points[:, 0], 10))
         y_range = float(np.percentile(points[:, 1], 90) - np.percentile(points[:, 1], 10))
 
-        small_horizontal_steps = np.logical_and(abs_dx > 0.0025, abs_dx < 0.070)
+        active_horizontal_steps = abs_dx > 0.0022
+        small_horizontal_steps = np.logical_and(abs_dx > 0.0022, abs_dx < 0.052)
+        large_horizontal_steps = abs_dx > 0.078
+        active_step_count = int(np.sum(active_horizontal_steps))
         small_step_count = int(np.sum(small_horizontal_steps))
+        active_ratio = active_step_count / max(len(abs_dx), 1)
+        active_span = 0.0
+        active_indices = np.flatnonzero(active_horizontal_steps)
+        if len(active_indices) >= 2:
+            active_span = float(times[active_indices[-1] + 1] - times[active_indices[0]])
 
         significant = dx[np.abs(dx) > 0.003]
         sign_changes = 0
@@ -397,6 +423,7 @@ class ReadingActivityDetector:
         negative_motion = float(np.sum(np.abs(significant[significant < 0.0]))) if len(significant) else 0.0
         bidirectional_motion = min(positive_motion, negative_motion)
         bidirectional_ratio = bidirectional_motion / max(total_horizontal_motion, 1e-6)
+        direction_texture = sign_changes >= 2 or bidirectional_ratio > 0.12
 
         recent = dx[-min(7, len(dx)) :]
         recent_abs = float(np.sum(np.abs(recent)))
@@ -407,25 +434,61 @@ class ReadingActivityDetector:
         if len(recent_significant) > 2:
             signs = np.sign(recent_significant)
             recent_changes = int(np.sum(signs[1:] * signs[:-1] < 0))
+        fresh = dx[-min(3, len(dx)) :]
+        fresh_abs = float(np.sum(np.abs(fresh)))
+        fresh_net = float(abs(np.sum(fresh)))
+        fresh_direct_ratio = fresh_net / max(fresh_abs, 1e-6)
+        fresh_max_step = float(np.max(np.abs(fresh))) if len(fresh) else 0.0
+        fresh_significant = fresh[np.abs(fresh) > 0.004]
+        fresh_changes = 0
+        if len(fresh_significant) > 2:
+            signs = np.sign(fresh_significant)
+            fresh_changes = int(np.sum(signs[1:] * signs[:-1] < 0))
 
         max_step = float(np.max(abs_dx)) if len(abs_dx) else 0.0
         net_horizontal_motion = float(abs(points[-1, 0] - points[0, 0]))
         path_direct_ratio = net_horizontal_motion / max(total_horizontal_motion, 1e-6)
-        directed_glance = (
-            (
-                max_step > 0.075
-                and small_step_count <= 3
-                and recent_abs > 0.040
-            )
-            or (
-                recent_abs > 0.050
-                and direct_ratio > 0.78
-                and recent_changes == 0
-            )
-            or (
-                total_horizontal_motion > 0.070
-                and path_direct_ratio > 0.68
-                and sign_changes <= 1
+        recent_max_step = float(np.max(np.abs(recent))) if len(recent) else 0.0
+        long_micro_scan = small_step_count >= 10 and active_span > 0.42 and max_step < 0.035
+        sustained_small_motion = (
+            small_step_count >= 5
+            and active_step_count >= 6
+            and active_ratio > 0.32
+            and active_span > 0.22
+            and total_horizontal_motion > 0.030
+            and horizontal_motion > 0.0030
+            and (direction_texture or long_micro_scan or path_direct_ratio < 0.74)
+        )
+        recent_direct_release = (
+            recent_abs > 0.050
+            and recent_max_step > 0.026
+            and direct_ratio > 0.78
+            and recent_changes == 0
+        ) or (
+            fresh_abs > 0.045
+            and fresh_max_step > 0.026
+            and fresh_direct_ratio > 0.84
+            and fresh_changes == 0
+        )
+        directed_glance = recent_direct_release or (
+            not sustained_small_motion
+            and (
+                (
+                    max_step > 0.075
+                    and small_step_count <= 4
+                    and recent_abs > 0.040
+                )
+                or (
+                    recent_abs > 0.050
+                    and direct_ratio > 0.78
+                    and recent_changes == 0
+                )
+                or (
+                    total_horizontal_motion > 0.070
+                    and path_direct_ratio > 0.68
+                    and sign_changes <= 1
+                    and active_step_count <= 5
+                )
             )
         )
         alternating_motion = (
@@ -439,6 +502,8 @@ class ReadingActivityDetector:
         )
 
         step_score = np.clip((small_step_count - 2.0) / 7.0, 0.0, 1.0)
+        density_score = np.clip((active_ratio - 0.26) / 0.46, 0.0, 1.0)
+        span_score = np.clip((active_span - 0.16) / 0.36, 0.0, 1.0)
         horizontal_score = np.clip((total_horizontal_motion - 0.018) / 0.14, 0.0, 1.0)
         range_score = np.clip((x_range - 0.015) / 0.16, 0.0, 1.0)
         return_score = np.clip((sign_changes - 1.0) / 3.0, 0.0, 1.0)
@@ -447,21 +512,27 @@ class ReadingActivityDetector:
         dominance_score = np.clip((dominance - 1.1) / 3.0, 0.0, 1.0)
         vertical_penalty = np.clip((vertical_motion - 0.014) / 0.055, 0.0, 1.0)
         drift_penalty = np.clip((y_range - 0.18) / 0.25, 0.0, 1.0)
+        big_jump_penalty = np.clip((int(np.sum(large_horizontal_steps)) - 0.5) / 2.0, 0.0, 1.0)
 
         evidence = (
-            step_score * 0.28
-            + horizontal_score * 0.18
-            + range_score * 0.12
-            + return_score * 0.20
-            + bidirectional_score * 0.14
-            + dominance_score * 0.08
+            step_score * 0.24
+            + density_score * 0.20
+            + span_score * 0.16
+            + horizontal_score * 0.16
+            + range_score * 0.10
+            + return_score * 0.08
+            + bidirectional_score * 0.04
+            + dominance_score * 0.06
             - vertical_penalty * 0.16
             - drift_penalty * 0.10
+            - big_jump_penalty * 0.18
         )
-        if not alternating_motion:
-            evidence *= 0.24
+        if not sustained_small_motion:
+            evidence *= 0.34
+        elif not alternating_motion:
+            evidence *= 0.82
         if directed_glance:
-            evidence *= 0.08
+            evidence = 0.0
 
         release = 1.0 if directed_glance else 0.0
         return float(np.clip(evidence, 0.0, 1.0)), release
@@ -647,6 +718,8 @@ class GazeCorrector:
         self.last_reading_active = False
         self.last_reading_score = 0.0
         self.last_effective_hold = 0.0
+        self.hold_filter_value = 0.0
+        self.hold_filter_time = time.monotonic()
         self.prev_face_motion: tuple[float, float, float, float] | None = None
         self.motion_guard_until = 0.0
 
@@ -790,6 +863,8 @@ class GazeCorrector:
         self.last_reading_active = False
         self.last_reading_score = 0.0
         self.last_effective_hold = 0.0
+        self.hold_filter_value = 0.0
+        self.hold_filter_time = time.monotonic()
         self.prev_face_motion = None
         self.motion_guard_until = 0.0
 
@@ -950,14 +1025,25 @@ class GazeCorrector:
         )
         if active:
             intensity = np.clip((score - 0.12) / 0.38, 0.0, 1.0)
+            target_hold = float(self.tuning_settings.reading_stabilizer * intensity)
         else:
-            intensity = np.clip((score - 0.18) / 0.34, 0.0, 0.22)
+            target_hold = 0.0
 
-        hold = float(self.tuning_settings.reading_stabilizer * intensity)
-        if hold < 0.08:
+        now = time.monotonic()
+        dt = max(1.0 / 120.0, min(now - self.hold_filter_time, 0.12))
+        self.hold_filter_time = now
+        tau = 0.055 if target_hold >= self.hold_filter_value else 0.095
+        alpha = 1.0 - math.exp(-dt / tau)
+        hold = self.hold_filter_value * (1.0 - alpha) + target_hold * alpha
+        self.hold_filter_value = float(np.clip(hold, 0.0, 1.0))
+
+        hold = self.hold_filter_value
+        if hold < 0.025:
             hold = 0.0
-            self.pupil_hold_filter.reset()
-            self.eye_output_hold_filter.reset()
+            self.hold_filter_value = 0.0
+            if target_hold <= 0.001:
+                self.pupil_hold_filter.reset()
+                self.eye_output_hold_filter.reset()
         self.last_reading_active = active
         self.last_reading_score = score
         self.last_effective_hold = hold
