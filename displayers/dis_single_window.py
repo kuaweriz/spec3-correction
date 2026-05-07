@@ -116,42 +116,91 @@ class SingleWindowGazeCorrector:
         self.gaze_correction_enabled = True
         self.calibration_mode = False
         self.camera_id = camera_id
-        self.settings_window_name = "Gaze Control"
+        self.settings_window_name = self.display_cfg.window_name
         self.should_quit = False
         self._dragging_control: Optional[str] = None
         self._slider_regions: dict[str, tuple[int, int, int, float, float]] = {}
         self._button_regions: dict[str, tuple[int, int, int, int]] = {}
+        self.control_panel_width = 430
+        self.preview_max_size = (1280, 720)
+        self._panel_origin_x = 0
+        self._last_canvas_size: tuple[int, int] | None = None
 
         # Store default values for reset
         self.default_camera_offset = self.gaze_corrector.get_camera_offset()
         self.default_focal_length = self.gaze_corrector.get_focal_length()
 
     def create_settings_panel(self) -> None:
-        """Create a custom OpenCV control panel."""
-        cv2.namedWindow(self.settings_window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.settings_window_name, 620, 560)
-        cv2.setMouseCallback(self.settings_window_name, self.handle_settings_mouse)
-        self.draw_settings_panel()
+        """Create the single application window with camera and controls."""
+        cv2.namedWindow(self.display_cfg.window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(self.display_cfg.window_name, self.handle_settings_mouse)
 
     def apply_settings_panel(self) -> None:
-        """Refresh the custom OpenCV control panel."""
-        self.draw_settings_panel()
+        """Kept for compatibility with older app loops."""
 
     def draw_settings_panel(self) -> None:
-        """Draw a custom, cleaner settings panel."""
+        """Kept for compatibility; the panel is now drawn into the main canvas."""
+
+    def compose_app_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Compose the camera preview and the control panel into one window."""
+        frame_h, frame_w = frame.shape[:2]
+        max_w, max_h = self.preview_max_size
+        scale = min(max_w / max(frame_w, 1), max_h / max(frame_h, 1))
+        scale = max(0.25, min(scale, 2.0))
+        preview_w = max(1, int(frame_w * scale))
+        preview_h = max(1, int(frame_h * scale))
+
+        if (preview_w, preview_h) != (frame_w, frame_h):
+            preview = cv2.resize(frame, (preview_w, preview_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            preview = frame
+
+        canvas_h = max(preview_h, 720)
+        canvas_w = preview_w + self.control_panel_width
+        canvas = np.full((canvas_h, canvas_w, 3), (16, 18, 23), dtype=np.uint8)
+
+        preview_y = (canvas_h - preview_h) // 2
+        canvas[preview_y:preview_y + preview_h, 0:preview_w] = preview
+        cv2.rectangle(canvas, (0, preview_y), (preview_w - 1, preview_y + preview_h - 1), (44, 49, 58), 1)
+
+        self._panel_origin_x = preview_w
+        cv2.line(canvas, (preview_w, 0), (preview_w, canvas_h), (54, 60, 72), 1, cv2.LINE_AA)
+        self.draw_control_panel(canvas, preview_w, canvas_h)
+
+        canvas_size = (canvas_w, canvas_h)
+        if self._last_canvas_size != canvas_size:
+            cv2.resizeWindow(self.display_cfg.window_name, canvas_w, canvas_h)
+            self._last_canvas_size = canvas_size
+
+        return canvas
+
+    def draw_control_panel(self, canvas: np.ndarray, x0: int, height: int) -> None:
+        """Draw the integrated control panel on the right side of the app."""
         tuning = self.gaze_corrector.get_tuning()
-        panel = np.full((560, 620, 3), (24, 26, 31), dtype=np.uint8)
+        reading_active, reading_score, effective_hold = self.gaze_corrector.get_reading_state()
+        panel_w = self.control_panel_width
+        x1 = x0 + panel_w
         self._slider_regions.clear()
         self._button_regions.clear()
 
-        cv2.rectangle(panel, (0, 0), (620, 92), (31, 34, 41), -1)
-        cv2.putText(panel, "Gaze Control", (28, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (245, 247, 250), 2, cv2.LINE_AA)
-        cv2.putText(panel, "Simple controls for stable, natural eye contact", (30, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 166, 176), 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (x0 + 1, 0), (x1, height), (22, 24, 30), -1)
+        cv2.rectangle(canvas, (x0 + 1, 0), (x1, 96), (28, 32, 40), -1)
 
-        self._draw_button(panel, "toggle", (420, 24, 568, 62), "ON" if tuning.enabled else "OFF", tuning.enabled)
-        self._draw_button(panel, "reading", (420, 360, 568, 400), "Reading", False)
-        self._draw_button(panel, "quit", (420, 440, 568, 480), "Quit", False, danger=True)
-        self._draw_button(panel, "reset", (420, 490, 568, 530), "Reset", False)
+        title_x = x0 + 28
+        cv2.putText(canvas, "Gaze Studio", (title_x, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.88, (246, 248, 252), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Camera and controls in one place", (title_x, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (158, 166, 178), 1, cv2.LINE_AA)
+
+        on_label = "ON" if tuning.enabled and self.gaze_correction_enabled else "OFF"
+        self._draw_button(canvas, "toggle", (x0 + 292, 24, x0 + 392, 62), on_label, tuning.enabled and self.gaze_correction_enabled)
+
+        mode_label = "READ" if reading_active else "LIVE"
+        mode_color = (78, 183, 126) if reading_active else (89, 145, 217)
+        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 392, 178), (30, 34, 42), -1)
+        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 392, 178), (56, 64, 78), 1)
+        cv2.putText(canvas, "Adaptive mode", (x0 + 46, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (212, 218, 226), 1, cv2.LINE_AA)
+        cv2.putText(canvas, mode_label, (x0 + 298, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.58, mode_color, 2, cv2.LINE_AA)
+        self._draw_meter(canvas, x0 + 46, 158, x0 + 216, reading_score, "read")
+        self._draw_meter(canvas, x0 + 230, 158, x0 + 374, effective_hold, "hold")
 
         sliders = [
             ("strength", "Strength", tuning.strength * 100.0, 0.0, 150.0, "%"),
@@ -162,25 +211,37 @@ class SingleWindowGazeCorrector:
             ("live", "Live Look", tuning.natural_motion * 100.0, 0.0, 100.0, "%"),
         ]
 
-        y = 128
+        track_x1 = x0 + 34
+        track_x2 = x0 + 286
+        y = 220
         for key, label, value, min_value, max_value, suffix in sliders:
-            self._draw_slider(panel, key, label, value, min_value, max_value, suffix, y)
+            self._draw_slider(canvas, key, label, value, min_value, max_value, suffix, y, track_x1, track_x2)
             y += 58
 
-        cv2.putText(panel, "Auto: READ holds pupils; LIVE allows natural motion.", (30, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (168, 174, 184), 1, cv2.LINE_AA)
-        cv2.putText(panel, "Keys: G on/off  R reset  C calibration  Q quit", (30, 518), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (168, 174, 184), 1, cv2.LINE_AA)
-        cv2.imshow(self.settings_window_name, panel)
+        button_y = min(height - 94, 608)
+        self._draw_button(canvas, "reading", (x0 + 28, button_y, x0 + 186, button_y + 42), "Reading Preset", reading_active)
+        self._draw_button(canvas, "reset", (x0 + 202, button_y, x0 + 292, button_y + 42), "Reset", False)
+        self._draw_button(canvas, "quit", (x0 + 308, button_y, x0 + 392, button_y + 42), "Quit", False, danger=True)
+
+        footer_y = min(height - 28, button_y + 78)
+        calib = "on" if self.calibration_mode else "off"
+        cv2.putText(canvas, f"Keys: G on/off  R reset  C calibration ({calib})  Q quit", (x0 + 28, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (138, 147, 160), 1, cv2.LINE_AA)
+
+    def _draw_meter(self, panel: np.ndarray, x1: int, y: int, x2: int, value: float, label: str) -> None:
+        value = max(0.0, min(value, 1.0))
+        cv2.putText(panel, label, (x1, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (148, 157, 170), 1, cv2.LINE_AA)
+        cv2.line(panel, (x1 + 44, y - 11), (x2, y - 11), (64, 70, 84), 5, cv2.LINE_AA)
+        fill_x = int((x1 + 44) + value * (x2 - (x1 + 44)))
+        cv2.line(panel, (x1 + 44, y - 11), (fill_x, y - 11), (84, 178, 130), 5, cv2.LINE_AA)
 
     def reset_settings_panel(self) -> None:
         """Reset tuning sliders and saved tuning values."""
         self.gaze_corrector.reset_tuning()
         self.gaze_correction_enabled = True
-        self.draw_settings_panel()
 
     def toggle_correction(self) -> None:
         self.gaze_correction_enabled = not self.gaze_correction_enabled
         self.gaze_corrector.set_tuning(enabled=self.gaze_correction_enabled)
-        self.draw_settings_panel()
 
     def request_quit(self) -> None:
         self.should_quit = True
@@ -218,19 +279,21 @@ class SingleWindowGazeCorrector:
         max_value: float,
         suffix: str,
         y: int,
+        x1: int = 30,
+        x2: int = 380,
     ) -> None:
-        x1, x2 = 30, 380
         track_y = y + 28
         value = max(min_value, min(value, max_value))
         ratio = 0.0 if max_value == min_value else (value - min_value) / (max_value - min_value)
         knob_x = int(x1 + ratio * (x2 - x1))
 
         cv2.putText(panel, label, (x1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 234, 240), 1, cv2.LINE_AA)
-        cv2.putText(panel, f"{value:+.0f}{suffix}" if min_value < 0 else f"{value:.0f}{suffix}", (395, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 220, 176), 1, cv2.LINE_AA)
+        value_text = f"{value:+.0f}{suffix}" if min_value < 0 else f"{value:.0f}{suffix}"
+        cv2.putText(panel, value_text, (x2 + 18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (142, 224, 182), 1, cv2.LINE_AA)
         cv2.line(panel, (x1, track_y), (x2, track_y), (70, 76, 88), 8, cv2.LINE_AA)
-        cv2.line(panel, (x1, track_y), (knob_x, track_y), (74, 171, 124), 8, cv2.LINE_AA)
+        cv2.line(panel, (x1, track_y), (knob_x, track_y), (94, 184, 132), 8, cv2.LINE_AA)
         cv2.circle(panel, (knob_x, track_y), 11, (236, 241, 246), -1, cv2.LINE_AA)
-        cv2.circle(panel, (knob_x, track_y), 12, (74, 171, 124), 2, cv2.LINE_AA)
+        cv2.circle(panel, (knob_x, track_y), 12, (94, 184, 132), 2, cv2.LINE_AA)
         self._slider_regions[key] = (x1, track_y, x2, min_value, max_value)
 
     def handle_settings_mouse(self, event: int, x: int, y: int, _flags: int, _param) -> None:
@@ -273,7 +336,6 @@ class SingleWindowGazeCorrector:
         elif key == "reset":
             self.reset_settings_panel()
             return
-        self.draw_settings_panel()
 
     def _set_slider_from_x(self, key: str, x: int, save: bool) -> None:
         x1, _track_y, x2, min_value, max_value = self._slider_regions[key]
@@ -295,7 +357,6 @@ class SingleWindowGazeCorrector:
             kwargs["natural_motion"] = value / 100.0
 
         self.gaze_corrector.set_tuning(**kwargs)
-        self.draw_settings_panel()
 
     def draw_status(self, frame) -> None:
         """Draw status overlay on frame."""
@@ -556,12 +617,10 @@ class SingleWindowGazeCorrector:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.display_cfg.video_size[0])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.display_cfg.video_size[1])
 
-        cv2.namedWindow(self.display_cfg.window_name)
         self.create_settings_panel()
         self.logger.log("Press 'g' to toggle gaze, 'c' for calibration, 'q' to quit")
 
         while True:
-            self.apply_settings_panel()
             if self.should_quit:
                 break
 
@@ -575,13 +634,12 @@ class SingleWindowGazeCorrector:
             else:
                 display_frame = frame.copy()
 
-            self.draw_status(display_frame)
-
             # Draw calibration overlay if enabled
             if self.calibration_mode:
                 self.draw_calibration_overlay(display_frame)
 
-            cv2.imshow(self.display_cfg.window_name, display_frame)
+            app_frame = self.compose_app_frame(display_frame)
+            cv2.imshow(self.display_cfg.window_name, app_frame)
             try:
                 if cv2.getWindowProperty(self.display_cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
                     self.logger.log("Main window closed")
@@ -594,9 +652,7 @@ class SingleWindowGazeCorrector:
             if key_ascii in (ord("q"), ord("Q"), 27):
                 break
             elif key_ascii in (ord("g"), ord("G")):
-                self.gaze_correction_enabled = not self.gaze_correction_enabled
-                self.gaze_corrector.set_tuning(enabled=self.gaze_correction_enabled)
-                self.draw_settings_panel()
+                self.toggle_correction()
                 self.logger.log(
                     f"Gaze correction: {'enabled' if self.gaze_correction_enabled else 'disabled'}"
                 )
