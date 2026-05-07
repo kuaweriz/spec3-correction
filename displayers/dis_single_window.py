@@ -266,21 +266,35 @@ class SingleWindowGazeCorrector:
         self._slider_regions.clear()
         self._button_regions.clear()
 
-        cv2.rectangle(canvas, (x0 + 1, 0), (x1, height), (22, 24, 30), -1)
-        cv2.rectangle(canvas, (x0 + 1, 0), (x1, 96), (28, 32, 40), -1)
+        panel_bg = (18, 19, 23)
+        header_bg = (25, 25, 31)
+        card_bg = (31, 31, 38)
+        card_line = (66, 66, 78)
+        muted = (158, 164, 176)
+        text = (242, 245, 250)
+        accent = (102, 203, 135)
+        live_accent = (224, 157, 88)
+
+        cv2.rectangle(canvas, (x0 + 1, 0), (x1, height), panel_bg, -1)
+        cv2.rectangle(canvas, (x0 + 1, 0), (x1, 96), header_bg, -1)
+        cv2.line(canvas, (x0 + 1, 95), (x1, 95), (47, 51, 60), 1, cv2.LINE_AA)
+        cv2.line(canvas, (x0 + 28, 82), (x0 + 392, 82), (43, 47, 56), 1, cv2.LINE_AA)
 
         title_x = x0 + 28
-        cv2.putText(canvas, "Gaze Studio", (title_x, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.88, (246, 248, 252), 2, cv2.LINE_AA)
-        cv2.putText(canvas, "Camera and controls in one place", (title_x, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (158, 166, 178), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (title_x + 6, 36), 5, accent, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (title_x + 6, 36), 9, (42, 72, 54), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "Gaze Studio", (title_x + 22, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.82, text, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Live gaze control", (title_x + 24, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.43, muted, 1, cv2.LINE_AA)
 
         on_label = "ON" if tuning.enabled and self.gaze_correction_enabled else "OFF"
         self._draw_button(canvas, "toggle", (x0 + 292, 24, x0 + 392, 62), on_label, tuning.enabled and self.gaze_correction_enabled)
 
         mode_label = "READ" if reading_active else "LIVE"
-        mode_color = (78, 183, 126) if reading_active else (89, 145, 217)
-        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 392, 178), (30, 34, 42), -1)
-        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 392, 178), (56, 64, 78), 1)
-        cv2.putText(canvas, "Adaptive mode", (x0 + 46, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (212, 218, 226), 1, cv2.LINE_AA)
+        mode_color = accent if reading_active else live_accent
+        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 392, 178), card_bg, -1)
+        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 392, 178), card_line, 1)
+        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 33, 178), mode_color, -1)
+        cv2.putText(canvas, "Adaptive mode", (x0 + 46, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (218, 223, 232), 1, cv2.LINE_AA)
         cv2.putText(canvas, mode_label, (x0 + 298, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.58, mode_color, 2, cv2.LINE_AA)
         self._draw_meter(canvas, x0 + 46, 158, x0 + 216, reading_score, "read")
         self._draw_meter(canvas, x0 + 230, 158, x0 + 374, effective_hold, "hold")
@@ -307,8 +321,7 @@ class SingleWindowGazeCorrector:
         self._draw_button(canvas, "quit", (x0 + 308, button_y, x0 + 392, button_y + 42), "Hide", False, danger=True)
 
         footer_y = min(height - 28, button_y + 78)
-        calib = "on" if self.calibration_mode else "off"
-        cv2.putText(canvas, f"Keys: G on/off  R reset  C calibration ({calib})  Q hide", (x0 + 28, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (138, 147, 160), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Menu bar controls window and correction", (x0 + 28, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (138, 147, 160), 1, cv2.LINE_AA)
 
     def _draw_meter(self, panel: np.ndarray, x1: int, y: int, x2: int, value: float, label: str) -> None:
         value = max(0.0, min(value, 1.0))
@@ -339,17 +352,30 @@ class SingleWindowGazeCorrector:
         danger: bool = False,
     ) -> None:
         x1, y1, x2, y2 = rect
-        color = (78, 89, 108)
+        color = (58, 63, 74)
+        border = (88, 96, 110)
+        text_color = (243, 246, 250)
         if active:
-            color = (68, 174, 118)
+            color = (67, 163, 102)
+            border = (118, 215, 145)
         if danger:
-            color = (170, 79, 88)
+            color = (82, 66, 72)
+            border = (152, 104, 113)
+            text_color = (250, 239, 242)
+
+        cv2.rectangle(panel, (x1 + 2, y1 + 3), (x2 + 2, y2 + 3), (11, 12, 15), -1)
         cv2.rectangle(panel, (x1, y1), (x2, y2), color, -1)
-        cv2.rectangle(panel, (x1, y1), (x2, y2), (92, 99, 112), 1)
-        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0]
+        cv2.line(panel, (x1 + 1, y1), (x2 - 1, y1), tuple(min(c + 24, 255) for c in color), 1, cv2.LINE_AA)
+        cv2.rectangle(panel, (x1, y1), (x2, y2), border, 1)
+        scale = 0.55
+        while scale > 0.34:
+            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0]
+            if text_size[0] <= x2 - x1 - 14:
+                break
+            scale -= 0.04
         tx = x1 + (x2 - x1 - text_size[0]) // 2
         ty = y1 + (y2 - y1 + text_size[1]) // 2
-        cv2.putText(panel, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (248, 250, 252), 1, cv2.LINE_AA)
+        cv2.putText(panel, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, 1, cv2.LINE_AA)
         self._button_regions[key] = rect
 
     def _draw_slider(
@@ -370,13 +396,21 @@ class SingleWindowGazeCorrector:
         ratio = 0.0 if max_value == min_value else (value - min_value) / (max_value - min_value)
         knob_x = int(x1 + ratio * (x2 - x1))
 
-        cv2.putText(panel, label, (x1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 234, 240), 1, cv2.LINE_AA)
+        cv2.putText(panel, label, (x1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (224, 229, 238), 1, cv2.LINE_AA)
         value_text = f"{value:+.0f}{suffix}" if min_value < 0 else f"{value:.0f}{suffix}"
         cv2.putText(panel, value_text, (x2 + 18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (142, 224, 182), 1, cv2.LINE_AA)
-        cv2.line(panel, (x1, track_y), (x2, track_y), (70, 76, 88), 8, cv2.LINE_AA)
-        cv2.line(panel, (x1, track_y), (knob_x, track_y), (94, 184, 132), 8, cv2.LINE_AA)
-        cv2.circle(panel, (knob_x, track_y), 11, (236, 241, 246), -1, cv2.LINE_AA)
-        cv2.circle(panel, (knob_x, track_y), 12, (94, 184, 132), 2, cv2.LINE_AA)
+        cv2.line(panel, (x1, track_y), (x2, track_y), (58, 62, 72), 8, cv2.LINE_AA)
+        fill_color = (94, 191, 128)
+        if min_value < 0 < max_value:
+            zero_ratio = (0.0 - min_value) / (max_value - min_value)
+            zero_x = int(x1 + zero_ratio * (x2 - x1))
+            cv2.line(panel, (zero_x, track_y - 10), (zero_x, track_y + 10), (88, 94, 108), 1, cv2.LINE_AA)
+            cv2.line(panel, (zero_x, track_y), (knob_x, track_y), fill_color, 8, cv2.LINE_AA)
+        else:
+            cv2.line(panel, (x1, track_y), (knob_x, track_y), fill_color, 8, cv2.LINE_AA)
+        cv2.circle(panel, (knob_x, track_y), 13, (12, 13, 16), -1, cv2.LINE_AA)
+        cv2.circle(panel, (knob_x, track_y), 10, (238, 243, 240), -1, cv2.LINE_AA)
+        cv2.circle(panel, (knob_x, track_y), 12, fill_color, 2, cv2.LINE_AA)
         self._slider_regions[key] = (x1, track_y, x2, min_value, max_value)
 
     def handle_settings_mouse(self, event: int, x: int, y: int, _flags: int, _param) -> None:
