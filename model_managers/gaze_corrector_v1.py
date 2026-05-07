@@ -353,20 +353,20 @@ class ReadingActivityDetector:
         ) * 0.5
         self.history.append((now, point))
 
-        while self.history and now - self.history[0][0] > 0.95:
+        while self.history and now - self.history[0][0] > 1.15:
             self.history.popleft()
 
         evidence, release = self._reading_evidence()
         if release > 0:
-            self.score *= 1.0 - 0.72 * release
+            self.score *= 1.0 - 0.58 * release
 
-        rate = 0.34 if evidence >= self.score else 0.30
+        rate = 0.48 if evidence >= self.score else 0.36
         self.score = float(np.clip(self.score * (1.0 - rate) + evidence * rate, 0.0, 1.0))
 
         if self.active:
-            self.active = self.score > 0.26
+            self.active = self.score > 0.22
         else:
-            self.active = self.score > 0.40
+            self.active = self.score > 0.32
         return self.active, self.score
 
     def _reading_evidence(self) -> tuple[float, float]:
@@ -381,10 +381,14 @@ class ReadingActivityDetector:
         abs_dx = np.abs(dx)
         horizontal_motion = float(np.mean(abs_dx))
         vertical_motion = float(np.mean(np.abs(dy)))
+        total_horizontal_motion = float(np.sum(abs_dx))
         x_range = float(np.percentile(points[:, 0], 90) - np.percentile(points[:, 0], 10))
         y_range = float(np.percentile(points[:, 1], 90) - np.percentile(points[:, 1], 10))
 
-        significant = dx[np.abs(dx) > 0.004]
+        small_horizontal_steps = np.logical_and(abs_dx > 0.0025, abs_dx < 0.070)
+        small_step_count = int(np.sum(small_horizontal_steps))
+
+        significant = dx[np.abs(dx) > 0.003]
         sign_changes = 0
         if len(significant) > 2:
             signs = np.sign(significant)
@@ -394,32 +398,41 @@ class ReadingActivityDetector:
         recent_abs = float(np.sum(np.abs(recent)))
         recent_net = float(abs(np.sum(recent)))
         direct_ratio = recent_net / max(recent_abs, 1e-6)
-        recent_significant = recent[np.abs(recent) > 0.005]
+        recent_significant = recent[np.abs(recent) > 0.004]
         recent_changes = 0
         if len(recent_significant) > 2:
             signs = np.sign(recent_significant)
             recent_changes = int(np.sum(signs[1:] * signs[:-1] < 0))
+
+        max_step = float(np.max(abs_dx)) if len(abs_dx) else 0.0
         directed_glance = (
-            recent_abs > 0.035
-            and direct_ratio > 0.72
+            max_step > 0.075
+            and small_step_count <= 2
+            and recent_abs > 0.050
+            and direct_ratio > 0.80
             and recent_changes == 0
         )
 
-        horizontal_score = np.clip((horizontal_motion - 0.004) / 0.025, 0.0, 1.0)
-        range_score = np.clip((x_range - 0.035) / 0.22, 0.0, 1.0)
+        step_score = np.clip((small_step_count - 2.0) / 7.0, 0.0, 1.0)
+        horizontal_score = np.clip((total_horizontal_motion - 0.018) / 0.14, 0.0, 1.0)
+        range_score = np.clip((x_range - 0.015) / 0.16, 0.0, 1.0)
         return_score = np.clip(sign_changes / 3.0, 0.0, 1.0)
+        dominance = horizontal_motion / max(vertical_motion, 0.003)
+        dominance_score = np.clip((dominance - 1.1) / 3.0, 0.0, 1.0)
         vertical_penalty = np.clip((vertical_motion - 0.014) / 0.055, 0.0, 1.0)
         drift_penalty = np.clip((y_range - 0.18) / 0.25, 0.0, 1.0)
 
         evidence = (
-            horizontal_score * 0.38
-            + range_score * 0.28
-            + return_score * 0.34
+            step_score * 0.40
+            + horizontal_score * 0.24
+            + range_score * 0.16
+            + return_score * 0.10
+            + dominance_score * 0.10
             - vertical_penalty * 0.16
             - drift_penalty * 0.10
         )
         if directed_glance:
-            evidence *= 0.35
+            evidence *= 0.18
 
         release = 1.0 if directed_glance else 0.0
         return float(np.clip(evidence, 0.0, 1.0)), release
@@ -903,9 +916,9 @@ class GazeCorrector:
             le_closed or re_closed,
         )
         if active:
-            intensity = np.clip((score - 0.18) / 0.48, 0.0, 1.0)
+            intensity = np.clip((score - 0.12) / 0.38, 0.0, 1.0)
         else:
-            intensity = np.clip((score - 0.24) / 0.42, 0.0, 0.28)
+            intensity = np.clip((score - 0.18) / 0.34, 0.0, 0.22)
 
         hold = float(self.tuning_settings.reading_stabilizer * intensity)
         if hold < 0.08:
