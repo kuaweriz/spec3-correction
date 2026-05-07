@@ -14,6 +14,7 @@ import numpy as np
 import tensorflow as tf
 import cv2
 from dataclasses import dataclass
+from collections import deque
 
 from tf_models.gaze_corrector_v1 import gaze_warp_model
 from utils.logger import Logger
@@ -158,7 +159,7 @@ class OneEuroVectorFilter:
         self.prev_time = None
         self.started_at = time.monotonic()
 
-    def apply(self, value: list[float]) -> list[float]:
+    def apply(self, value: list[float], natural_scale: float = 1.0) -> list[float]:
         """Return a smoothed gaze angle vector [vertical, horizontal]."""
         now = time.monotonic()
         value_np = np.asarray(value, dtype=np.float32)
@@ -167,7 +168,7 @@ class OneEuroVectorFilter:
             self.prev_value = value_np
             self.prev_derivative = np.zeros_like(value_np)
             self.prev_time = now
-            return self._add_natural_motion(value_np).tolist()
+            return self._add_natural_motion(value_np, natural_scale).tolist()
 
         dt = max(1.0 / 120.0, min(now - self.prev_time, 0.1))
         raw_delta = value_np - self.prev_value
@@ -199,17 +200,17 @@ class OneEuroVectorFilter:
         self.prev_derivative = derivative_hat
         self.prev_time = now
 
-        return self._add_natural_motion(filtered).tolist()
+        return self._add_natural_motion(filtered, natural_scale).tolist()
 
-    def _add_natural_motion(self, value: np.ndarray) -> np.ndarray:
-        if self.cfg.natural_motion_strength <= 0:
+    def _add_natural_motion(self, value: np.ndarray, natural_scale: float = 1.0) -> np.ndarray:
+        if self.cfg.natural_motion_strength <= 0 or natural_scale <= 0:
             return value
 
         t = time.monotonic() - self.started_at
         vertical = math.sin(t * 1.7) * 0.55 + math.sin(t * 0.53 + 1.2) * 0.45
         horizontal = math.sin(t * 1.3 + 2.1) * 0.6 + math.sin(t * 0.47) * 0.4
         natural = np.asarray([vertical, horizontal], dtype=np.float32)
-        return value + natural * self.cfg.natural_motion_strength
+        return value + natural * self.cfg.natural_motion_strength * natural_scale
 
 
 class PupilHoldFilter:
@@ -319,6 +320,86 @@ class EyeOutputHoldFilter:
         held = previous * (1.0 - alpha) + current * alpha
         self.previous[eye_side] = held
         return held
+
+
+class ReadingActivityDetector:
+    """Classifies reading from short-term iris motion patterns."""
+
+    def __init__(self):
+        self.history: deque[tuple[float, np.ndarray]] = deque(maxlen=90)
+        self.score = 0.0
+        self.active = False
+
+    def reset(self) -> None:
+        self.history.clear()
+        self.score = 0.0
+        self.active = False
+
+    def update(
+        self,
+        left_offset: tuple[float, float],
+        right_offset: tuple[float, float],
+        eyes_closed: bool,
+    ) -> tuple[bool, float]:
+        if eyes_closed:
+            self.score *= 0.82
+            self.active = self.score > 0.42
+            return self.active, self.score
+
+        now = time.monotonic()
+        point = (
+            np.asarray(left_offset, dtype=np.float32)
+            + np.asarray(right_offset, dtype=np.float32)
+        ) * 0.5
+        self.history.append((now, point))
+
+        while self.history and now - self.history[0][0] > 1.45:
+            self.history.popleft()
+
+        evidence = self._reading_evidence()
+        self.score = float(np.clip(self.score * 0.88 + evidence * 0.12, 0.0, 1.0))
+
+        if self.active:
+            self.active = self.score > 0.34
+        else:
+            self.active = self.score > 0.52
+        return self.active, self.score
+
+    def _reading_evidence(self) -> float:
+        if len(self.history) < 8:
+            return 0.0
+
+        points = np.asarray([point for _, point in self.history], dtype=np.float32)
+        diffs = np.diff(points, axis=0)
+        dx = diffs[:, 0]
+        dy = diffs[:, 1]
+
+        abs_dx = np.abs(dx)
+        horizontal_motion = float(np.mean(abs_dx))
+        vertical_motion = float(np.mean(np.abs(dy)))
+        x_range = float(np.percentile(points[:, 0], 90) - np.percentile(points[:, 0], 10))
+        y_range = float(np.percentile(points[:, 1], 90) - np.percentile(points[:, 1], 10))
+
+        significant = dx[np.abs(dx) > 0.004]
+        sign_changes = 0
+        if len(significant) > 2:
+            signs = np.sign(significant)
+            sign_changes = int(np.sum(signs[1:] * signs[:-1] < 0))
+
+        horizontal_score = np.clip((horizontal_motion - 0.004) / 0.025, 0.0, 1.0)
+        range_score = np.clip((x_range - 0.035) / 0.22, 0.0, 1.0)
+        return_score = np.clip(sign_changes / 4.0, 0.0, 1.0)
+        vertical_penalty = np.clip((vertical_motion - 0.014) / 0.055, 0.0, 1.0)
+        drift_penalty = np.clip((y_range - 0.18) / 0.25, 0.0, 1.0)
+
+        evidence = (
+            horizontal_score * 0.38
+            + range_score * 0.28
+            + return_score * 0.34
+            - vertical_penalty * 0.16
+            - drift_penalty * 0.10
+        )
+        return float(np.clip(evidence, 0.0, 1.0))
 
 
 ################################################################################
@@ -493,10 +574,14 @@ class GazeCorrector:
         self.gaze_filter = OneEuroVectorFilter(self.stabilization_cfg)
         self.pupil_hold_filter = PupilHoldFilter()
         self.eye_output_hold_filter = EyeOutputHoldFilter()
+        self.reading_detector = ReadingActivityDetector()
         self._apply_tuning_to_filter()
 
         # Last estimated eye position (for visualization)
         self.last_eye_position: list[float] = [0, 0, -60]
+        self.last_reading_active = False
+        self.last_reading_score = 0.0
+        self.last_effective_hold = 0.0
 
     def _load_camera_settings(self) -> CameraUserSetting:
         """Load camera settings from database or return defaults."""
@@ -634,6 +719,10 @@ class GazeCorrector:
         self.gaze_filter.reset()
         self.pupil_hold_filter.reset()
         self.eye_output_hold_filter.reset()
+        self.reading_detector.reset()
+        self.last_reading_active = False
+        self.last_reading_score = 0.0
+        self.last_effective_hold = 0.0
 
     def set_stabilization_enabled(self, enabled: bool) -> None:
         """Enable or disable gaze stabilization at runtime."""
@@ -644,6 +733,10 @@ class GazeCorrector:
     def get_tuning(self) -> GazeTuningSetting:
         """Get current manual gaze tuning settings."""
         return self.tuning_settings
+
+    def get_reading_state(self) -> tuple[bool, float, float]:
+        """Return adaptive reading state for UI display."""
+        return self.last_reading_active, self.last_reading_score, self.last_effective_hold
 
     def set_tuning(
         self,
@@ -714,6 +807,7 @@ class GazeCorrector:
         le_center: tuple[float, float], 
         re_center: tuple[float, float],
         video_size: tuple[int, int],
+        natural_scale: float = 1.0,
     ) -> tuple[list[float], list[float]]:
         """
         Estimate gaze redirection angles based on eye positions.
@@ -775,25 +869,44 @@ class GazeCorrector:
         ]
 
         if self.stabilization_cfg.enabled:
-            return self.gaze_filter.apply(tuned_alpha), eye_position
+            return self.gaze_filter.apply(tuned_alpha, natural_scale), eye_position
 
         return tuned_alpha, eye_position
 
-    def _get_pupil_delta(self, eye_data, eye_side: str) -> np.ndarray:
-        stabilizer = self.tuning_settings.reading_stabilizer
-        if stabilizer <= 0:
+    def _adaptive_reading_hold(self, le, re, le_closed: bool, re_closed: bool) -> float:
+        active, score = self.reading_detector.update(
+            le.pupil_offset,
+            re.pupil_offset,
+            le_closed or re_closed,
+        )
+        if active:
+            intensity = np.clip((score - 0.24) / 0.56, 0.0, 1.0)
+        else:
+            intensity = np.clip(score / 0.60, 0.0, 0.55)
+
+        hold = float(self.tuning_settings.reading_stabilizer * intensity)
+        self.last_reading_active = active
+        self.last_reading_score = score
+        self.last_effective_hold = hold
+        return hold
+
+    def _get_pupil_delta(
+        self, eye_data, eye_side: str, stabilizer: float
+    ) -> np.ndarray:
+        if stabilizer <= 0.01:
             return np.zeros(2, dtype=np.float32)
 
         return self.pupil_hold_filter.apply(
             eye_side, eye_data.pupil_offset, stabilizer
         )
 
-    def _paired_pupil_deltas(self, le, re) -> tuple[np.ndarray, np.ndarray]:
+    def _paired_pupil_deltas(
+        self, le, re, stabilizer: float
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Use one binocular stabilization signal so both pupils stay aligned."""
-        stabilizer = self.tuning_settings.reading_stabilizer
-        le_delta = self._get_pupil_delta(le, "L")
-        re_delta = self._get_pupil_delta(re, "R")
-        if stabilizer <= 0:
+        le_delta = self._get_pupil_delta(le, "L", stabilizer)
+        re_delta = self._get_pupil_delta(re, "R", stabilizer)
+        if stabilizer <= 0.01:
             return le_delta, re_delta
 
         paired_delta = (le_delta + re_delta) * 0.5
@@ -804,10 +917,9 @@ class GazeCorrector:
         )
 
     def _angle_with_pupil_delta(
-        self, angle: list[float], delta: np.ndarray
+        self, angle: list[float], delta: np.ndarray, stabilizer: float
     ) -> list[float]:
-        stabilizer = self.tuning_settings.reading_stabilizer
-        if stabilizer <= 0:
+        if stabilizer <= 0.01:
             return angle
 
         gain = stabilizer ** 1.35
@@ -824,10 +936,11 @@ class GazeCorrector:
         self.pupil_hold_filter.reset_eye(eye_side)
         self.eye_output_hold_filter.reset_eye(eye_side)
 
-    def _shift_corrected_eye(self, image: np.ndarray, delta: np.ndarray) -> np.ndarray:
+    def _shift_corrected_eye(
+        self, image: np.ndarray, delta: np.ndarray, stabilizer: float
+    ) -> np.ndarray:
         """Move the generated eye as one piece, preserving pupil/iris shape."""
-        stabilizer = self.tuning_settings.reading_stabilizer
-        if stabilizer <= 0:
+        if stabilizer <= 0.01:
             return image
 
         img = image.astype(np.float32)
@@ -853,6 +966,7 @@ class GazeCorrector:
         eye_data,
         eye_side: str,
         angle: list[float],
+        hold_strength: float,
         pupil_delta: np.ndarray | None = None,
     ) -> np.ndarray:
         """
@@ -870,9 +984,9 @@ class GazeCorrector:
             eye_side, eye_data.image, eye_data.anchor_map, angle
         )
         if pupil_delta is not None:
-            result = self._shift_corrected_eye(result, pupil_delta)
+            result = self._shift_corrected_eye(result, pupil_delta, hold_strength)
         result = self.eye_output_hold_filter.apply(
-            eye_side, result, self.tuning_settings.reading_stabilizer
+            eye_side, result, hold_strength
         )
         # Resize back to original size
         return cv2.resize(result, (eye_data.original_size[1], eye_data.original_size[0]))
@@ -990,31 +1104,37 @@ class GazeCorrector:
         if re_closed:
             self._reset_eye_temporal_state("R")
         if le_closed and re_closed:
+            self._adaptive_reading_hold(le, re, le_closed, re_closed)
             return frame
 
+        hold_strength = self._adaptive_reading_hold(le, re, le_closed, re_closed)
+        natural_scale = 1.0 - min(hold_strength, 1.0) * 0.96
+
         # Estimate gaze angle (video_size passed from outside)
-        alpha, _ = self.estimate_gaze_angle(le.center, re.center, video_size)
+        alpha, _ = self.estimate_gaze_angle(
+            le.center, re.center, video_size, natural_scale=natural_scale
+        )
         if not le_closed and not re_closed:
-            le_delta, re_delta = self._paired_pupil_deltas(le, re)
+            le_delta, re_delta = self._paired_pupil_deltas(le, re, hold_strength)
         else:
             le_delta = (
-                self._get_pupil_delta(le, "L")
+                self._get_pupil_delta(le, "L", hold_strength)
                 if not le_closed
                 else np.zeros(2, dtype=np.float32)
             )
             re_delta = (
-                self._get_pupil_delta(re, "R")
+                self._get_pupil_delta(re, "R", hold_strength)
                 if not re_closed
                 else np.zeros(2, dtype=np.float32)
             )
 
         if not le_closed:
-            le_alpha = self._angle_with_pupil_delta(alpha, le_delta)
-            le_corrected = self.correct_eye(le, "L", le_alpha, le_delta)
+            le_alpha = self._angle_with_pupil_delta(alpha, le_delta, hold_strength)
+            le_corrected = self.correct_eye(le, "L", le_alpha, hold_strength, le_delta)
             self._blend_eye_region(frame, le, le_corrected)
         if not re_closed:
-            re_alpha = self._angle_with_pupil_delta(alpha, re_delta)
-            re_corrected = self.correct_eye(re, "R", re_alpha, re_delta)
+            re_alpha = self._angle_with_pupil_delta(alpha, re_delta, hold_strength)
+            re_corrected = self.correct_eye(re, "R", re_alpha, hold_strength, re_delta)
             self._blend_eye_region(frame, re, re_corrected)
 
         return frame

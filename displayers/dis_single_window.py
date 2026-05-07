@@ -167,7 +167,7 @@ class SingleWindowGazeCorrector:
             self._draw_slider(panel, key, label, value, min_value, max_value, suffix, y)
             y += 58
 
-        cv2.putText(panel, "For reading: Live Look 0-6%, Pupil Hold 95-100%, Smooth 90-98%.", (30, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (168, 174, 184), 1, cv2.LINE_AA)
+        cv2.putText(panel, "Auto: READ holds pupils; LIVE allows natural motion.", (30, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (168, 174, 184), 1, cv2.LINE_AA)
         cv2.putText(panel, "Keys: G on/off  R reset  C calibration  Q quit", (30, 518), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (168, 174, 184), 1, cv2.LINE_AA)
         cv2.imshow(self.settings_window_name, panel)
 
@@ -266,9 +266,9 @@ class SingleWindowGazeCorrector:
             return
         elif key == "reading":
             self.gaze_corrector.set_tuning(
-                smoothing=0.96,
+                smoothing=0.88,
                 reading_stabilizer=1.0,
-                natural_motion=0.02,
+                natural_motion=0.18,
             )
         elif key == "reset":
             self.reset_settings_panel()
@@ -300,10 +300,14 @@ class SingleWindowGazeCorrector:
     def draw_status(self, frame) -> None:
         """Draw status overlay on frame."""
         tuning = self.gaze_corrector.get_tuning()
+        reading_active, reading_score, effective_hold = self.gaze_corrector.get_reading_state()
         status = "GAZE ON" if self.gaze_correction_enabled and tuning.enabled else "GAZE OFF"
         color = (0, 255, 0) if self.gaze_correction_enabled and tuning.enabled else (0, 0, 255)
 
-        cv2.rectangle(frame, (10, 10), (270, 118), (0, 0, 0), -1)
+        mode = "READ" if reading_active else "LIVE"
+        mode_color = (88, 220, 130) if reading_active else (120, 190, 255)
+
+        cv2.rectangle(frame, (10, 10), (315, 138), (0, 0, 0), -1)
         cv2.putText(
             frame, status, (20, 35),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA
@@ -323,8 +327,13 @@ class SingleWindowGazeCorrector:
             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA
         )
         cv2.putText(
-            frame, "Use Gaze Settings sliders | R reset",
+            frame, f"Mode {mode}  read {reading_score * 100:.0f}%  hold {effective_hold * 100:.0f}%",
             (20, 111),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.38, mode_color, 1, cv2.LINE_AA
+        )
+        cv2.putText(
+            frame, "Use Gaze Settings sliders | R reset",
+            (20, 129),
             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (170, 170, 170), 1, cv2.LINE_AA
         )
 
