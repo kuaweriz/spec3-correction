@@ -1,7 +1,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <Cocoa/Cocoa.h>
 
-@interface GazeAppDelegate : NSObject <NSApplicationDelegate>
+@interface GazeAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property(nonatomic, strong) NSTask *task;
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSMenuItem *openItem;
@@ -9,6 +9,10 @@
 @property(nonatomic, strong) NSMenuItem *enableItem;
 @property(nonatomic, strong) NSMenuItem *disableItem;
 @property(nonatomic, strong) NSFileHandle *logHandle;
+@property(nonatomic, strong) NSWindow *logWindow;
+@property(nonatomic, strong) NSTextView *logTextView;
+@property(nonatomic, strong) NSTextField *logStatusLabel;
+@property(nonatomic, strong) NSTimer *logRefreshTimer;
 @property(nonatomic, copy) NSString *projectPath;
 @property(nonatomic, copy) NSString *pythonPath;
 @property(nonatomic, copy) NSString *scriptPath;
@@ -35,7 +39,17 @@
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     self.isQuitting = YES;
+    [self.logRefreshTimer invalidate];
     [self stopCameraProcess];
+}
+
+- (void)application:(NSApplication *)application openURLs:(NSArray<NSURL *> *)urls {
+    for (NSURL *url in urls) {
+        if ([[url scheme] isEqualToString:@"spec3correction"] && [[[url host] lowercaseString] isEqualToString:@"logs"]) {
+            [self showLogWindow:nil];
+            return;
+        }
+    }
 }
 
 - (void)configurePaths {
@@ -95,6 +109,10 @@
     [menu addItem:self.disableItem];
 
     [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *logsItem = [[NSMenuItem alloc] initWithTitle:@"Open Logs" action:@selector(openLogs:) keyEquivalent:@""];
+    logsItem.target = self;
+    [menu addItem:logsItem];
+
     NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit" action:@selector(quitApp:) keyEquivalent:@""];
     quitItem.target = self;
     [menu addItem:quitItem];
@@ -202,6 +220,7 @@
     env[@"GAZE_CONTROL_FILE"] = self.controlPath;
     env[@"SPEC3_SUPPORT_DIR"] = [self.controlPath stringByDeletingLastPathComponent];
     env[@"SPEC3_CAMERA_LIST_FILE"] = self.cameraListPath;
+    env[@"SPEC3_LOG_FILE"] = self.logPath;
     [newTask setEnvironment:env];
     [newTask setStandardOutput:self.logHandle];
     [newTask setStandardError:self.logHandle];
@@ -252,6 +271,216 @@
         [self startCamera:nil];
     }
     [self sendCommand:@"disable"];
+}
+
+- (void)openLogs:(id)sender {
+    [self showLogWindow:sender];
+}
+
+- (void)showLogWindow:(id)sender {
+    if (!self.logWindow) {
+        [self createLogWindow];
+    }
+
+    [self refreshLogWindow:nil];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp activateIgnoringOtherApps:YES];
+    [self.logWindow makeKeyAndOrderFront:nil];
+
+    [self.logRefreshTimer invalidate];
+    self.logRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                            target:self
+                                                          selector:@selector(refreshLogWindow:)
+                                                          userInfo:nil
+                                                           repeats:YES];
+}
+
+- (void)createLogWindow {
+    NSRect frame = NSMakeRect(0, 0, 820, 560);
+    NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
+    self.logWindow = [[NSWindow alloc] initWithContentRect:frame
+                                                 styleMask:style
+                                                   backing:NSBackingStoreBuffered
+                                                     defer:NO];
+    self.logWindow.title = @"spec3 correction logs";
+    self.logWindow.releasedWhenClosed = NO;
+    self.logWindow.delegate = self;
+    self.logWindow.backgroundColor = [NSColor colorWithCalibratedRed:0.08 green:0.07 blue:0.07 alpha:1.0];
+    [self.logWindow center];
+
+    NSView *content = self.logWindow.contentView;
+
+    NSTextField *title = [NSTextField labelWithString:@"Logs"];
+    title.frame = NSMakeRect(24, 510, 260, 28);
+    title.font = [NSFont systemFontOfSize:24 weight:NSFontWeightSemibold];
+    title.textColor = [NSColor colorWithCalibratedRed:0.98 green:0.95 blue:0.91 alpha:1.0];
+    title.autoresizingMask = NSViewMinYMargin;
+    [content addSubview:title];
+
+    self.logStatusLabel = [NSTextField labelWithString:self.logPath];
+    self.logStatusLabel.frame = NSMakeRect(25, 486, 520, 20);
+    self.logStatusLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
+    self.logStatusLabel.textColor = [NSColor colorWithCalibratedRed:0.62 green:0.58 blue:0.55 alpha:1.0];
+    self.logStatusLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    self.logStatusLabel.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [content addSubview:self.logStatusLabel];
+
+    NSButton *refreshButton = [NSButton buttonWithTitle:@"Refresh" target:self action:@selector(refreshLogWindow:)];
+    refreshButton.frame = NSMakeRect(548, 500, 86, 32);
+    refreshButton.bezelStyle = NSBezelStyleRounded;
+    refreshButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [content addSubview:refreshButton];
+
+    NSButton *copyButton = [NSButton buttonWithTitle:@"Copy Path" target:self action:@selector(copyLogPath:)];
+    copyButton.frame = NSMakeRect(640, 500, 88, 32);
+    copyButton.bezelStyle = NSBezelStyleRounded;
+    copyButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [content addSubview:copyButton];
+
+    NSButton *fileButton = [NSButton buttonWithTitle:@"Open File" target:self action:@selector(openRawLogFile:)];
+    fileButton.frame = NSMakeRect(734, 500, 78, 32);
+    fileButton.bezelStyle = NSBezelStyleRounded;
+    fileButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [content addSubview:fileButton];
+
+    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(24, 24, 772, 448)];
+    scrollView.borderType = NSNoBorder;
+    scrollView.hasVerticalScroller = YES;
+    scrollView.autohidesScrollers = YES;
+    scrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    scrollView.drawsBackground = YES;
+    scrollView.backgroundColor = [NSColor colorWithCalibratedRed:0.12 green:0.10 blue:0.10 alpha:1.0];
+
+    self.logTextView = [[NSTextView alloc] initWithFrame:scrollView.contentView.bounds];
+    self.logTextView.editable = NO;
+    self.logTextView.selectable = YES;
+    self.logTextView.drawsBackground = YES;
+    self.logTextView.backgroundColor = [NSColor colorWithCalibratedRed:0.12 green:0.10 blue:0.10 alpha:1.0];
+    self.logTextView.textColor = [NSColor colorWithCalibratedRed:0.88 green:0.86 blue:0.82 alpha:1.0];
+    self.logTextView.font = [NSFont monospacedSystemFontOfSize:12.0 weight:NSFontWeightRegular];
+    self.logTextView.textContainerInset = NSMakeSize(14, 12);
+    self.logTextView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.logTextView.textContainer.widthTracksTextView = YES;
+    self.logTextView.textContainer.containerSize = NSMakeSize(scrollView.contentView.bounds.size.width, CGFLOAT_MAX);
+
+    scrollView.documentView = self.logTextView;
+    [content addSubview:scrollView];
+}
+
+- (void)refreshLogWindow:(id)sender {
+    if (!self.logTextView) {
+        return;
+    }
+
+    NSString *text = [self readLogPreview];
+    [self.logTextView.textStorage setAttributedString:[self styledLogText:text]];
+    [self.logTextView scrollRangeToVisible:NSMakeRange(self.logTextView.string.length, 0)];
+    self.logStatusLabel.stringValue = [self logStatusText];
+}
+
+- (NSString *)readLogPreview {
+    NSFileHandle *reader = [NSFileHandle fileHandleForReadingAtPath:self.logPath];
+    if (!reader) {
+        return @"Log file is not created yet.";
+    }
+
+    unsigned long long size = [reader seekToEndOfFile];
+    NSUInteger maxBytes = 256 * 1024;
+    NSString *prefix = @"";
+    if (size > maxBytes) {
+        [reader seekToFileOffset:(size - maxBytes)];
+        prefix = @"Showing the last 256 KB of the log.\n\n";
+    } else {
+        [reader seekToFileOffset:0];
+    }
+
+    NSData *data = [reader readDataToEndOfFile];
+    [reader closeFile];
+
+    NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!body) {
+        body = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding] ?: @"Could not decode log text.";
+    }
+    if (body.length == 0) {
+        body = @"Log is empty.";
+    }
+    return [prefix stringByAppendingString:body];
+}
+
+- (NSAttributedString *)styledLogText:(NSString *)text {
+    NSMutableAttributedString *result = [[NSMutableAttributedString alloc] init];
+    NSFont *font = [NSFont monospacedSystemFontOfSize:12.0 weight:NSFontWeightRegular];
+    NSMutableParagraphStyle *paragraph = [[NSMutableParagraphStyle alloc] init];
+    paragraph.lineSpacing = 2.0;
+
+    NSColor *normal = [NSColor colorWithCalibratedRed:0.86 green:0.84 blue:0.80 alpha:1.0];
+    NSColor *muted = [NSColor colorWithCalibratedRed:0.58 green:0.56 blue:0.54 alpha:1.0];
+    NSColor *blue = [NSColor colorWithCalibratedRed:0.48 green:0.73 blue:1.00 alpha:1.0];
+    NSColor *green = [NSColor colorWithCalibratedRed:0.54 green:0.86 blue:0.57 alpha:1.0];
+    NSColor *orange = [NSColor colorWithCalibratedRed:1.00 green:0.62 blue:0.28 alpha:1.0];
+    NSColor *red = [NSColor colorWithCalibratedRed:1.00 green:0.38 blue:0.43 alpha:1.0];
+
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        NSString *lower = [line lowercaseString];
+        NSColor *color = normal;
+        if ([lower containsString:@"error"] || [lower containsString:@"failed"] ||
+            [lower containsString:@"could not"] || [lower containsString:@"traceback"] ||
+            [lower containsString:@"exception"]) {
+            color = red;
+        } else if ([lower containsString:@"warning"] || [lower containsString:@"deprecated"]) {
+            color = orange;
+        } else if ([lower containsString:@"command:"] || [lower containsString:@"camera"]) {
+            color = blue;
+        } else if ([lower containsString:@"launching"] || [lower containsString:@"native start"] ||
+                   [lower containsString:@"shutdown complete"]) {
+            color = green;
+        } else if (line.length == 0 || [lower containsString:@"showing the last"]) {
+            color = muted;
+        }
+
+        NSDictionary *attrs = @{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: color,
+            NSParagraphStyleAttributeName: paragraph,
+        };
+        NSString *lineWithBreak = [line stringByAppendingString:@"\n"];
+        [result appendAttributedString:[[NSAttributedString alloc] initWithString:lineWithBreak attributes:attrs]];
+    }
+    return result;
+}
+
+- (NSString *)logStatusText {
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:self.logPath error:nil];
+    NSNumber *sizeNumber = attrs[NSFileSize];
+    NSDate *modified = attrs[NSFileModificationDate];
+    double kb = sizeNumber ? sizeNumber.doubleValue / 1024.0 : 0.0;
+    NSString *timeText = @"not updated yet";
+    if (modified) {
+        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+        formatter.dateStyle = NSDateFormatterNoStyle;
+        formatter.timeStyle = NSDateFormatterMediumStyle;
+        timeText = [formatter stringFromDate:modified];
+    }
+    return [NSString stringWithFormat:@"%@  •  %.1f KB  •  updated %@", self.logPath, kb, timeText];
+}
+
+- (void)copyLogPath:(id)sender {
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+    [pasteboard clearContents];
+    [pasteboard setString:self.logPath forType:NSPasteboardTypeString];
+    self.logStatusLabel.stringValue = @"Log path copied to clipboard";
+}
+
+- (void)openRawLogFile:(id)sender {
+    NSURL *logURL = [NSURL fileURLWithPath:self.logPath];
+    [[NSWorkspace sharedWorkspace] openURL:logURL];
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    if (notification.object == self.logWindow) {
+        [self.logRefreshTimer invalidate];
+        self.logRefreshTimer = nil;
+    }
 }
 
 - (void)quitApp:(id)sender {
