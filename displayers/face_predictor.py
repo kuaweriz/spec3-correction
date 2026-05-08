@@ -132,7 +132,11 @@ class DlibFacePredictor(FacePredictor):
     RIGHT_EYE_INDICES = [36, 37, 38, 39, 40, 41]  # Right eye from viewer's perspective
     LEFT_EYE_INDICES = [42, 43, 44, 45, 46, 47]  # Left eye from viewer's perspective
 
-    def __init__(self, predictor_path: str = "./lm_feat/shape_predictor_68_face_landmarks.dat"):
+    def __init__(
+        self,
+        predictor_path: str = "./lm_feat/shape_predictor_68_face_landmarks.dat",
+        detect_max_side: int = 720,
+    ):
         """
         Initialize dlib face predictor.
 
@@ -144,6 +148,7 @@ class DlibFacePredictor(FacePredictor):
         self.detector = dlib.get_frontal_face_detector()
         self.predictor = dlib.shape_predictor(predictor_path)
         self._dlib = dlib  # Keep reference for rectangle creation
+        self.detect_max_side = detect_max_side
 
     def _detect_faces(self, gray_frame: np.ndarray) -> list:
         """Detect faces using dlib's HOG-based detector."""
@@ -319,18 +324,30 @@ class DlibFacePredictor(FacePredictor):
     ) -> list[FaceData]:
         """Detect faces and extract eye data for gaze correction."""
         results: list[FaceData] = []
-        
-        # Detect faces on grayscale
+
+        # Detect on a smaller grayscale frame, then predict landmarks against the
+        # full frame. Dlib HOG face detection is the expensive part of the loop.
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self._detect_faces(gray)
-        
-        for face in faces:
-            # Get landmarks (no scaling needed when using full frame)
-            landmarks = self._predict_landmarks(gray, face, (1.0, 1.0))
+        detect_gray = gray
+        x_ratio = 1.0
+        y_ratio = 1.0
+        frame_h, frame_w = gray.shape[:2]
+        max_side = max(frame_w, frame_h)
+        if max_side > self.detect_max_side:
+            scale = self.detect_max_side / max_side
+            detect_w = max(1, int(frame_w * scale))
+            detect_h = max(1, int(frame_h * scale))
+            detect_gray = cv2.resize(gray, (detect_w, detect_h), interpolation=cv2.INTER_AREA)
+            x_ratio = frame_w / detect_w
+            y_ratio = frame_h / detect_h
+
+        faces = self._detect_faces(detect_gray)
+
+        for face in faces[:1]:
+            landmarks = self._predict_landmarks(gray, face, (x_ratio, y_ratio))
             if landmarks is None:
                 continue
-            
-            # Extract eye data
+
             face_data = self._extract_eye_data(frame, landmarks, config)
             results.append(face_data)
         

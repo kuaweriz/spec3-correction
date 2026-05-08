@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import math
+import subprocess
 import threading
 import time
 import cv2
@@ -114,6 +115,7 @@ class DisplayConfig:
 
     video_size: tuple[int, int] = (640, 480)
     face_detect_size: tuple[int, int] = (320, 240)
+    processing_max_size: tuple[int, int] = (1280, 720)
     window_name: str = "spec3 correction"
 
     @property
@@ -132,6 +134,52 @@ class CalibrationConfig:
     step_xy: float = 0.5      # cm per key press for X/Y
     step_z: float = 0.5       # cm per key press for Z
     step_focal: float = 10.0  # pixels per key press for focal length
+
+
+class CameraFrameStream:
+    """Continuously read the latest camera frame so processing never builds a backlog."""
+
+    def __init__(self, cap, logger: Logger):
+        self.cap = cap
+        self.logger = logger
+        self._lock = threading.Lock()
+        self._running = True
+        self._frame: np.ndarray | None = None
+        self._frame_id = 0
+        self._last_frame_time = 0.0
+        self._failed_reads = 0
+        self._thread = threading.Thread(target=self._reader, name="spec3-camera-stream", daemon=True)
+        self._thread.start()
+
+    def _reader(self) -> None:
+        while self._running:
+            ret, frame = self.cap.read()
+            now = time.monotonic()
+            with self._lock:
+                if ret and frame is not None:
+                    self._frame = frame
+                    self._frame_id += 1
+                    self._last_frame_time = now
+                    self._failed_reads = 0
+                else:
+                    self._failed_reads += 1
+            if not ret:
+                time.sleep(0.01)
+
+    def snapshot(self) -> tuple[int, np.ndarray | None, float, int]:
+        with self._lock:
+            frame = self._frame
+            frame_id = self._frame_id
+            last_frame_time = self._last_frame_time
+            failed_reads = self._failed_reads
+
+        age = time.monotonic() - last_frame_time if last_frame_time > 0.0 else 999.0
+        return frame_id, frame, age, failed_reads
+
+    def release(self) -> None:
+        self._running = False
+        self._thread.join(timeout=0.5)
+        self.cap.release()
 
 
 ################################################################################
@@ -208,6 +256,9 @@ class SingleWindowGazeCorrector:
         self.window_visible = True
         self._window_created = False
         self.control_file_path = os.environ.get("GAZE_CONTROL_FILE")
+        self.log_file_path = os.environ.get("SPEC3_LOG_FILE") or os.path.expanduser(
+            "~/Library/Logs/spec3 correction.log"
+        )
         self._last_control_mtime = 0.0
         self._pending_hide_window = False
         self._pending_show_window = False
@@ -496,6 +547,8 @@ class SingleWindowGazeCorrector:
             self.set_correction_enabled(False)
         elif command == "toggle":
             self.toggle_correction()
+        elif command == "logs":
+            self.open_logs()
         elif command == "quit":
             self.request_quit()
 
@@ -607,9 +660,10 @@ class SingleWindowGazeCorrector:
             y += 56
 
         button_y = min(height - 94, 626)
-        self._draw_button(canvas, "reading", (x0 + 28, button_y, x0 + 186, button_y + 42), "Reading Preset", reading_active)
-        self._draw_button(canvas, "reset", (x0 + 202, button_y, x0 + 292, button_y + 42), "Reset", False)
-        self._draw_button(canvas, "quit", (x0 + 308, button_y, x0 + 392, button_y + 42), "Hide", False, danger=True)
+        self._draw_button(canvas, "app_quit", (x0 + 28, button_y, x0 + 104, button_y + 42), "Quit", False, danger=True)
+        self._draw_button(canvas, "logs", (x0 + 116, button_y, x0 + 194, button_y + 42), "Logs", False)
+        self._draw_button(canvas, "reset", (x0 + 206, button_y, x0 + 292, button_y + 42), "Reset", False)
+        self._draw_button(canvas, "hide", (x0 + 308, button_y, x0 + 392, button_y + 42), "Hide", False)
 
         footer_y = min(height - 28, button_y + 78)
         self._draw_text(canvas, "Menu bar controls window and correction", (x0 + 28, footer_y), 12, (138, 147, 160))
@@ -812,6 +866,40 @@ class SingleWindowGazeCorrector:
     def request_quit(self) -> None:
         self.should_quit = True
 
+    def open_logs(self) -> None:
+        log_path = os.path.expanduser(self.log_file_path)
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            if not os.path.exists(log_path):
+                with open(log_path, "a", encoding="utf-8"):
+                    pass
+            subprocess.run(
+                ["open", "-b", "local.spec3-correction", "spec3correction://logs"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            )
+            self.logger.log("Requested native log viewer")
+        except OSError as exc:
+            self.logger.log(f"Could not open logs: {exc}")
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+            subprocess.Popen(["open", log_path])
+            self.logger.log(f"Opened raw log fallback: {log_path}")
+
+    def request_app_quit(self) -> None:
+        self.should_quit = True
+        try:
+            subprocess.Popen(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application id "local.spec3-correction" to quit',
+                ]
+            )
+        except OSError as exc:
+            self.logger.log(f"Could not ask native app to quit: {exc}")
+
     def _draw_button(
         self,
         panel: np.ndarray,
@@ -938,15 +1026,15 @@ class SingleWindowGazeCorrector:
             if camera is not None:
                 self.request_camera_select(camera.id, camera.name)
             return
-        elif key == "quit":
+        elif key == "hide":
             self.request_hide_window()
             return
-        elif key == "reading":
-            self.gaze_corrector.set_tuning(
-                smoothing=0.88,
-                reading_stabilizer=1.0,
-                natural_motion=0.18,
-            )
+        elif key == "app_quit":
+            self.request_app_quit()
+            return
+        elif key == "logs":
+            self.open_logs()
+            return
         elif key == "reset":
             self.reset_settings_panel()
             return
@@ -1224,6 +1312,17 @@ class SingleWindowGazeCorrector:
 
         return display_frame
 
+    def _prepare_pipeline_frame(self, frame: np.ndarray) -> np.ndarray:
+        max_w, max_h = self.display_cfg.processing_max_size
+        frame_h, frame_w = frame.shape[:2]
+        scale = min(max_w / max(frame_w, 1), max_h / max(frame_h, 1), 1.0)
+        if scale >= 0.999:
+            return frame
+
+        resized_w = max(1, int(frame_w * scale))
+        resized_h = max(1, int(frame_h * scale))
+        return cv2.resize(frame, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+
     def _frame_live_metrics(self, frame: np.ndarray) -> tuple[bool, float, float, float, float]:
         """Return a conservative live-camera quality estimate for fallback selection."""
         if frame.ndim == 3:
@@ -1287,8 +1386,11 @@ class SingleWindowGazeCorrector:
                 self.logger.log(f"Camera {camera_id} did not open with {backend_name}")
                 continue
 
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.display_cfg.video_size[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.display_cfg.video_size[1])
+            requested_w = min(self.display_cfg.video_size[0], self.display_cfg.processing_max_size[0])
+            requested_h = min(self.display_cfg.video_size[1], self.display_cfg.processing_max_size[1])
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, requested_w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, requested_h)
+            cap.set(cv2.CAP_PROP_FPS, 30)
             if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
@@ -1363,9 +1465,9 @@ class SingleWindowGazeCorrector:
         self._last_canvas_size = None
         self.logger.log(f"Video size updated to {frame_w}x{frame_h}")
 
-    def _apply_pending_camera_switch(self, cap):
+    def _apply_pending_camera_switch(self, stream: CameraFrameStream):
         if self._pending_camera_id is None:
-            return cap
+            return stream
 
         next_camera_id = self._pending_camera_id
         requested_label = self._pending_camera_label
@@ -1373,7 +1475,7 @@ class SingleWindowGazeCorrector:
         self._pending_camera_label = ""
         if next_camera_id == self.camera_id:
             self._camera_switching = False
-            return cap
+            return stream
 
         self.logger.log(f"Switching camera {self.camera_id} -> {next_camera_id}")
         next_cap, actual_camera_id = self._open_camera_capture(next_camera_id, requested_label)
@@ -1386,9 +1488,9 @@ class SingleWindowGazeCorrector:
             self._camera_switching = False
             self._set_camera_status("Camera did not respond", 3.0)
             self.refresh_camera_options(force=True, async_refresh=True)
-            return cap
+            return stream
 
-        cap.release()
+        stream.release()
         self.camera_id = actual_camera_id
         self.camera_label = requested_label or camera_name(self.camera_id, self.camera_options)
         self._remember_camera_label(self.camera_id, self.camera_label)
@@ -1398,7 +1500,7 @@ class SingleWindowGazeCorrector:
         self._set_camera_status(f"Selected slot #{self.camera_id}", 2.0)
         self.refresh_camera_options(force=False, async_refresh=True)
         self.gaze_corrector.reset_tracking()
-        return next_cap
+        return CameraFrameStream(next_cap, self.logger)
 
     def run(self):
         """Main application loop."""
@@ -1412,29 +1514,39 @@ class SingleWindowGazeCorrector:
             self._remember_camera_label(self.camera_id, self.camera_label)
             if not is_virtual_camera_name(self.camera_label):
                 save_camera_id(self.camera_id, self.camera_label)
+        stream = CameraFrameStream(cap, self.logger)
 
         self.create_settings_panel()
         self.logger.log("Press 'g' to toggle gaze, 'c' for calibration, 'q' to hide")
 
         failed_reads = 0
+        last_frame_id = 0
         while True:
             self.process_control_command()
             self.apply_pending_window_actions()
-            cap = self._apply_pending_camera_switch(cap)
+            stream = self._apply_pending_camera_switch(stream)
             if self.should_quit:
                 break
 
-            ret, frame = cap.read()
-            if not ret:
+            frame_id, frame, frame_age, stream_failed_reads = stream.snapshot()
+            if frame is None:
                 failed_reads += 1
                 if failed_reads <= 60:
                     if failed_reads == 1:
                         self.logger.log("Camera returned an empty frame; waiting briefly")
-                    time.sleep(0.03)
+                    time.sleep(0.01)
                     continue
                 self.logger.log("Failed to read frame after retries")
                 break
+            if frame_id == last_frame_id:
+                if stream_failed_reads > 60 and frame_age > 2.0:
+                    self.logger.log("Camera stream stopped returning fresh frames")
+                    break
+                time.sleep(0.003)
+                continue
+            last_frame_id = frame_id
             failed_reads = 0
+            frame = self._prepare_pipeline_frame(frame)
             self._update_video_size_from_frame(frame)
 
             if self.gaze_correction_enabled:
@@ -1485,7 +1597,7 @@ class SingleWindowGazeCorrector:
 
         # Cleanup
         self.gaze_corrector.save_tuning_settings()
-        cap.release()
+        stream.release()
         cv2.destroyAllWindows()
         self.gaze_corrector.close()
         self.logger.log("Shutdown complete")

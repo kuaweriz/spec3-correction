@@ -296,7 +296,7 @@ class PupilHoldFilter:
 
 
 class EyeOutputHoldFilter:
-    """Temporally holds the generated eye crop so reading saccades do not leak out."""
+    """Temporally holds iris detail without freezing the whole eye crop."""
 
     def __init__(self):
         self.previous: dict[str, np.ndarray] = {}
@@ -306,6 +306,19 @@ class EyeOutputHoldFilter:
 
     def reset_eye(self, eye_side: str) -> None:
         self.previous.pop(eye_side, None)
+
+    def _iris_weight(self, image: np.ndarray) -> np.ndarray:
+        h, w = image.shape[:2]
+        mask = np.zeros((h, w), dtype=np.float32)
+        center = (int(w * 0.50), int(h * 0.53))
+        axes = (max(2, int(w * 0.25)), max(2, int(h * 0.30)))
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+        blur = max(5, int(min(h, w) * 0.18) | 1)
+        mask = cv2.GaussianBlur(mask, (blur, blur), 0)
+
+        luma = image.mean(axis=2)
+        dark = np.clip((0.48 - luma) / 0.32, 0.0, 1.0)
+        return np.clip(mask * (0.35 + 0.65 * dark), 0.0, 1.0)
 
     def apply(self, eye_side: str, image: np.ndarray, hold_strength: float) -> np.ndarray:
         current = image.astype(np.float32)
@@ -339,7 +352,7 @@ class EyeOutputHoldFilter:
             self.previous[eye_side] = current
             return image
 
-        # High reading hold means the generated eye should barely update frame-to-frame.
+        # High reading hold should stabilize the iris, not paste an old eyelid/skin crop.
         alpha = 0.008 + 0.34 * ((1.0 - hold_strength) ** 2.0)
         if diff > 0.24:
             alpha = max(alpha, 0.22)
@@ -347,8 +360,10 @@ class EyeOutputHoldFilter:
             alpha = max(alpha, 0.06)
 
         held = previous * (1.0 - alpha) + current * alpha
-        self.previous[eye_side] = held
-        return held
+        iris_weight = self._iris_weight(current)[:, :, None] * np.clip(hold_strength, 0.0, 1.0)
+        output = held * iris_weight + current * (1.0 - iris_weight)
+        self.previous[eye_side] = output
+        return output
 
 
 class ReadingActivityDetector:
@@ -394,9 +409,9 @@ class ReadingActivityDetector:
         evidence, release = self._reading_evidence(now)
         self.last_release = release
         if release > 0:
-            self.release_until = max(self.release_until, now + 0.34)
+            self.release_until = max(self.release_until, now + 0.20 + 0.08 * release)
             self.active_until = 0.0
-            self.score = min(self.score * (1.0 - 0.86 * release), 0.12)
+            self.score = min(self.score * (1.0 - 0.92 * release), 0.08)
             if self.history:
                 latest = self.history[-1]
                 self.history.clear()
@@ -404,29 +419,31 @@ class ReadingActivityDetector:
         if now < self.release_until:
             evidence *= 0.04
 
-        if evidence > 0.28:
-            self.active_until = max(self.active_until, now + 0.58)
+        if evidence > 0.38:
+            self.active_until = max(self.active_until, now + 0.46)
 
-        if evidence > 0.54:
-            rate = 0.78
+        if evidence > 0.56:
+            rate = 0.86
+        elif evidence > 0.38:
+            rate = 0.74
         else:
-            rate = 0.62 if evidence >= self.score else (0.14 if self.active else 0.34)
+            rate = 0.58 if evidence >= self.score else (0.18 if self.active else 0.38)
         self.score = float(np.clip(self.score * (1.0 - rate) + evidence * rate, 0.0, 1.0))
 
         if now < self.release_until:
             self.active = False
         elif self.active:
-            self.active = self.score > 0.15 or now < self.active_until
+            self.active = self.score > 0.13 or now < self.active_until
         else:
-            self.active = self.score > 0.29 or evidence > 0.62
+            self.active = self.score > 0.22 or evidence > 0.46
         return self.active, self.score
 
     def _reading_evidence(self, now: float) -> tuple[float, float]:
-        if len(self.history) < 5:
+        if len(self.history) < 4:
             return 0.0, 0.0
 
-        window = [(t, point) for t, point in self.history if now - t <= 0.88]
-        if len(window) < 5:
+        window = [(t, point) for t, point in self.history if now - t <= 0.72]
+        if len(window) < 4:
             window = list(self.history)
 
         times = np.asarray([t for t, _point in window], dtype=np.float32)
@@ -443,10 +460,11 @@ class ReadingActivityDetector:
         y_range = float(np.percentile(points[:, 1], 90) - np.percentile(points[:, 1], 10))
         mean_x_abs = float(abs(np.mean(points[:, 0])))
         end_x_abs = float(abs(points[-1, 0]))
+        duration = float(times[-1] - times[0]) if len(times) > 1 else 0.0
 
         active_horizontal_steps = abs_dx > 0.0022
-        small_horizontal_steps = np.logical_and(abs_dx > 0.0022, abs_dx < 0.052)
-        large_horizontal_steps = abs_dx > 0.078
+        small_horizontal_steps = np.logical_and(abs_dx > 0.0022, abs_dx < 0.046)
+        large_horizontal_steps = abs_dx > 0.070
         active_step_count = int(np.sum(active_horizontal_steps))
         small_step_count = int(np.sum(small_horizontal_steps))
         active_ratio = active_step_count / max(len(abs_dx), 1)
@@ -464,7 +482,6 @@ class ReadingActivityDetector:
         negative_motion = float(np.sum(np.abs(significant[significant < 0.0]))) if len(significant) else 0.0
         bidirectional_motion = min(positive_motion, negative_motion)
         bidirectional_ratio = bidirectional_motion / max(total_horizontal_motion, 1e-6)
-        direction_texture = sign_changes >= 2 or bidirectional_ratio > 0.12
 
         recent = dx[-min(7, len(dx)) :]
         recent_abs = float(np.sum(np.abs(recent)))
@@ -495,63 +512,36 @@ class ReadingActivityDetector:
         net_horizontal_motion = float(abs(points[-1, 0] - points[0, 0]))
         path_direct_ratio = net_horizontal_motion / max(total_horizontal_motion, 1e-6)
         recent_max_step = float(np.max(np.abs(recent))) if len(recent) else 0.0
+
         side_fixation = (
-            end_x_abs > 0.165
-            and mean_x_abs > 0.135
-            and x_range < 0.090
-            and total_horizontal_motion < 0.220
-            and max_step < 0.065
+            end_x_abs > 0.140
+            and mean_x_abs > 0.112
+            and x_range < 0.082
+            and total_horizontal_motion < 0.185
+            and max_step < 0.060
         )
         side_noise = (
-            end_x_abs > 0.205
-            and x_range < 0.075
+            end_x_abs > 0.165
+            and mean_x_abs > 0.125
+            and x_range < 0.110
             and active_span > 0.20
-            and bidirectional_ratio > 0.20
-        )
-        long_micro_scan = (
-            small_step_count >= 10
-            and active_span > 0.42
-            and max_step < 0.035
-            and path_direct_ratio < 0.64
-            and bidirectional_ratio > 0.08
-        )
-        progressive_reading_scan = (
-            small_step_count >= 7
-            and active_step_count >= 8
-            and active_ratio > 0.30
-            and active_span > 0.36
-            and total_horizontal_motion > 0.040
-            and horizontal_motion > 0.0032
-            and max_step < 0.050
-            and median_active_step < 0.028
-            and y_range < 0.155
-            and vertical_motion < 0.026
-            and (mean_x_abs < 0.135 or x_range > 0.075)
-            and not side_fixation
-        )
-        alternating_motion = (
-            sign_changes >= 2
+            and total_horizontal_motion < 0.240
             and bidirectional_ratio > 0.16
-            and small_step_count >= 4
-        ) or (
-            recent_changes >= 2
-            and bidirectional_ratio > 0.12
-            and small_step_count >= 3
         )
-        scan_texture = alternating_motion or long_micro_scan or progressive_reading_scan
-        meaningful_scan_range = x_range > 0.018 and total_horizontal_motion > 0.045
-        sustained_small_motion = (
-            (
-                small_step_count >= 5
-                and active_step_count >= 6
-                and active_ratio > 0.32
-                and active_span > 0.22
-                and total_horizontal_motion > 0.030
-                and horizontal_motion > 0.0030
-                and meaningful_scan_range
-                and scan_texture
-            )
-            or progressive_reading_scan
+        side_zone = end_x_abs > 0.155 or mean_x_abs > 0.135
+        center_zone = end_x_abs < 0.155 and mean_x_abs < 0.125
+
+        direct_jump = (
+            max_step > 0.070
+            and path_direct_ratio > 0.64
+            and sign_changes <= 1
+        )
+        single_direction_glance = (
+            total_horizontal_motion > 0.045
+            and path_direct_ratio > 0.82
+            and bidirectional_ratio < 0.10
+            and sign_changes <= 1
+            and (small_step_count <= 3 or max_step > 0.050)
         )
         slow_direct_glance = (
             total_horizontal_motion > 0.036
@@ -559,83 +549,130 @@ class ReadingActivityDetector:
             and bidirectional_ratio < 0.10
             and sign_changes <= 1
             and active_span < 0.72
-        ) or side_fixation or side_noise
+            and small_step_count <= 4
+        )
         recent_direct_release = (
             recent_abs > 0.050
             and recent_max_step > 0.026
             and direct_ratio > 0.78
             and recent_changes == 0
+            and small_step_count <= 4
         ) or (
             fresh_abs > 0.045
             and fresh_max_step > 0.026
             and fresh_direct_ratio > 0.84
             and fresh_changes == 0
-        )
-        directed_glance = recent_direct_release or slow_direct_glance or (
-            not sustained_small_motion
-            and (
-                (
-                    max_step > 0.075
-                    and small_step_count <= 4
-                    and recent_abs > 0.040
-                )
-                or (
-                    recent_abs > 0.050
-                    and direct_ratio > 0.78
-                    and recent_changes == 0
-                )
-                or (
-                    total_horizontal_motion > 0.070
-                    and path_direct_ratio > 0.68
-                    and sign_changes <= 1
-                    and active_step_count <= 5
-                )
-            )
+            and small_step_count <= 4
         )
 
-        step_score = np.clip((small_step_count - 2.0) / 7.0, 0.0, 1.0)
-        density_score = np.clip((active_ratio - 0.26) / 0.46, 0.0, 1.0)
-        span_score = np.clip((active_span - 0.16) / 0.36, 0.0, 1.0)
-        horizontal_score = np.clip((total_horizontal_motion - 0.018) / 0.14, 0.0, 1.0)
-        range_score = np.clip((x_range - 0.015) / 0.16, 0.0, 1.0)
-        return_score = np.clip((sign_changes - 1.0) / 3.0, 0.0, 1.0)
-        bidirectional_score = np.clip((bidirectional_ratio - 0.10) / 0.24, 0.0, 1.0)
+        directed_glance = (
+            direct_jump
+            or single_direction_glance
+            or slow_direct_glance
+            or recent_direct_release
+            or side_fixation
+            or side_noise
+            or (
+                side_zone
+                and not (x_range > 0.115 and bidirectional_ratio > 0.20)
+                and total_horizontal_motion < 0.260
+            )
+        )
+        if directed_glance:
+            return 0.0, 1.0
+
+        meaningful_scan_range = x_range > 0.010 and total_horizontal_motion > 0.018
+        stable_vertical = y_range < 0.150 and vertical_motion < 0.026
+        central_micro_read = (
+            center_zone
+            and small_step_count >= 3
+            and active_step_count >= 3
+            and active_ratio > 0.30
+            and active_span > 0.10
+            and total_horizontal_motion > 0.012
+            and horizontal_motion > 0.0016
+            and max_step < 0.042
+            and median_active_step < 0.026
+            and stable_vertical
+            and path_direct_ratio < 0.86
+        )
+        progressive_reading_scan = (
+            small_step_count >= 3
+            and active_step_count >= 3
+            and active_ratio > 0.34
+            and active_span > 0.13
+            and total_horizontal_motion > 0.018
+            and horizontal_motion > 0.0022
+            and max_step < 0.055
+            and median_active_step < 0.030
+            and stable_vertical
+            and meaningful_scan_range
+            and (center_zone or x_range > 0.055)
+        )
+        alternating_motion = (
+            sign_changes >= 1
+            and bidirectional_ratio > 0.10
+            and small_step_count >= 3
+            and total_horizontal_motion > 0.018
+            and stable_vertical
+            and (center_zone or x_range > 0.055)
+        ) or (
+            recent_changes >= 1
+            and bidirectional_ratio > 0.10
+            and small_step_count >= 3
+            and stable_vertical
+            and center_zone
+        )
+        long_micro_scan = (
+            small_step_count >= 5
+            and active_span > 0.22
+            and max_step < 0.040
+            and total_horizontal_motion > 0.024
+            and stable_vertical
+            and center_zone
+        )
+        read_like = central_micro_read or progressive_reading_scan or alternating_motion or long_micro_scan
+        if not read_like:
+            return 0.0, 0.0
+
+        step_score = np.clip((small_step_count - 2.0) / 5.0, 0.0, 1.0)
+        density_score = np.clip((active_ratio - 0.28) / 0.42, 0.0, 1.0)
+        span_score = np.clip((active_span - 0.10) / 0.30, 0.0, 1.0)
+        horizontal_score = np.clip((total_horizontal_motion - 0.018) / 0.095, 0.0, 1.0)
+        range_score = np.clip((x_range - 0.012) / 0.105, 0.0, 1.0)
+        return_score = np.clip(sign_changes / 3.0, 0.0, 1.0)
+        bidirectional_score = np.clip((bidirectional_ratio - 0.07) / 0.22, 0.0, 1.0)
         dominance = horizontal_motion / max(vertical_motion, 0.003)
         dominance_score = np.clip((dominance - 1.1) / 3.0, 0.0, 1.0)
         vertical_penalty = np.clip((vertical_motion - 0.014) / 0.055, 0.0, 1.0)
         drift_penalty = np.clip((y_range - 0.18) / 0.25, 0.0, 1.0)
-        big_jump_penalty = np.clip((int(np.sum(large_horizontal_steps)) - 0.5) / 2.0, 0.0, 1.0)
+        big_jump_penalty = np.clip((int(np.sum(large_horizontal_steps)) - 0.2) / 1.6, 0.0, 1.0)
 
         evidence = (
-            step_score * 0.24
-            + density_score * 0.20
-            + span_score * 0.16
+            step_score * 0.26
+            + density_score * 0.18
+            + span_score * 0.17
             + horizontal_score * 0.16
-            + range_score * 0.10
+            + range_score * 0.08
             + return_score * 0.08
-            + bidirectional_score * 0.04
-            + dominance_score * 0.06
-            - vertical_penalty * 0.16
+            + bidirectional_score * 0.06
+            + dominance_score * 0.05
+            - vertical_penalty * 0.18
             - drift_penalty * 0.10
-            - big_jump_penalty * 0.18
+            - big_jump_penalty * 0.22
         )
-        if not sustained_small_motion:
-            evidence *= 0.34
-        elif progressive_reading_scan and not alternating_motion:
-            evidence = max(evidence * 0.94, 0.50)
-        elif not alternating_motion:
-            evidence *= 0.82
-        if scan_texture and meaningful_scan_range and active_span > 0.18 and active_ratio > 0.34:
-            evidence = max(evidence, 0.46 + min(sign_changes, 4) * 0.055)
         if progressive_reading_scan:
-            evidence = max(evidence, 0.54)
-        if side_fixation or side_noise:
-            evidence = 0.0
-        if directed_glance:
-            evidence = 0.0
+            evidence = max(evidence, 0.50)
+        if central_micro_read:
+            evidence = max(evidence, 0.50)
+        if alternating_motion:
+            evidence = max(evidence, 0.52 + min(sign_changes, 3) * 0.04)
+        if long_micro_scan:
+            evidence = max(evidence, 0.48)
+        if progressive_reading_scan:
+            evidence += min(max(duration - 0.18, 0.0) * 0.20, 0.06)
 
-        release = 1.0 if directed_glance else 0.0
-        return float(np.clip(evidence, 0.0, 1.0)), release
+        return float(np.clip(evidence, 0.0, 1.0)), 0.0
 
 
 ################################################################################
@@ -822,6 +859,8 @@ class GazeCorrector:
         self.hold_filter_time = time.monotonic()
         self.prev_face_motion: tuple[float, float, float, float] | None = None
         self.motion_guard_until = 0.0
+        self.eye_closed_previous = {"L": False, "R": False}
+        self.eye_reopen_time = {"L": 0.0, "R": 0.0}
 
     def _load_camera_settings(self) -> CameraUserSetting:
         """Load camera settings from database or return defaults."""
@@ -967,6 +1006,8 @@ class GazeCorrector:
         self.hold_filter_time = time.monotonic()
         self.prev_face_motion = None
         self.motion_guard_until = 0.0
+        self.eye_closed_previous = {"L": False, "R": False}
+        self.eye_reopen_time = {"L": 0.0, "R": 0.0}
 
     def set_stabilization_enabled(self, enabled: bool) -> None:
         """Enable or disable gaze stabilization at runtime."""
@@ -1133,14 +1174,14 @@ class GazeCorrector:
                 self.eye_output_hold_filter.reset()
             self.hold_filter_value = 0.0
         elif active:
-            intensity = np.clip((score - 0.08) / 0.30, 0.0, 1.0)
+            intensity = np.clip((score - 0.045) / 0.255, 0.0, 1.0)
             target_hold = float(self.tuning_settings.reading_stabilizer * intensity)
         else:
             target_hold = 0.0
 
         dt = max(1.0 / 120.0, min(now - self.hold_filter_time, 0.12))
         self.hold_filter_time = now
-        tau = 0.032 if target_hold >= self.hold_filter_value else 0.060
+        tau = 0.022 if target_hold >= self.hold_filter_value else 0.052
         alpha = 1.0 - math.exp(-dt / tau)
         hold = self.hold_filter_value * (1.0 - alpha) + target_hold * alpha
         self.hold_filter_value = float(np.clip(hold, 0.0, 1.0))
@@ -1209,10 +1250,55 @@ class GazeCorrector:
 
         paired_delta = (le_delta + re_delta) * 0.5
         pair_lock = stabilizer ** 1.8
+        locked_le = le_delta * (1.0 - pair_lock) + paired_delta * pair_lock
+        locked_re = re_delta * (1.0 - pair_lock) + paired_delta * pair_lock
         return (
-            le_delta * (1.0 - pair_lock) + paired_delta * pair_lock,
-            re_delta * (1.0 - pair_lock) + paired_delta * pair_lock,
+            self._limit_pupil_delta(locked_le, stabilizer),
+            self._limit_pupil_delta(locked_re, stabilizer),
         )
+
+    def _limit_pupil_delta(self, delta: np.ndarray, stabilizer: float) -> np.ndarray:
+        if stabilizer <= 0.01:
+            return delta
+
+        max_x = 0.105 + 0.055 * (1.0 - stabilizer)
+        max_y = 0.060 + 0.035 * (1.0 - stabilizer)
+        limited = np.asarray(
+            [
+                np.clip(delta[0], -max_x, max_x),
+                np.clip(delta[1], -max_y, max_y),
+            ],
+            dtype=np.float32,
+        )
+        max_mag = 0.125 + 0.070 * (1.0 - stabilizer)
+        mag = float(np.linalg.norm(limited))
+        if mag > max_mag:
+            limited *= max_mag / mag
+        return limited
+
+    def _safe_pupil_compensation(
+        self, delta: np.ndarray, stabilizer: float
+    ) -> tuple[float, float]:
+        gain = stabilizer ** 1.35
+        vertical = -float(delta[1]) * 82.0 * gain
+        horizontal = -float(delta[0]) * 104.0 * gain
+        max_vertical = 4.8 + 2.4 * (1.0 - stabilizer)
+        max_horizontal = 7.2 + 3.2 * (1.0 - stabilizer)
+        return (
+            float(np.clip(vertical, -max_vertical, max_vertical)),
+            float(np.clip(horizontal, -max_horizontal, max_horizontal)),
+        )
+
+    def _safe_final_angle(self, angle: list[float], stabilizer: float) -> list[float]:
+        if stabilizer <= 0.01:
+            return angle
+
+        max_vertical = 42.0 + 18.0 * (1.0 - stabilizer)
+        max_horizontal = 32.0 + 12.0 * (1.0 - stabilizer)
+        return [
+            float(np.clip(angle[0], -max_vertical, max_vertical)),
+            float(np.clip(angle[1], -max_horizontal, max_horizontal)),
+        ]
 
     def _angle_with_pupil_delta(
         self, angle: list[float], delta: np.ndarray, stabilizer: float
@@ -1220,15 +1306,44 @@ class GazeCorrector:
         if stabilizer <= 0.01:
             return angle
 
-        gain = stabilizer ** 1.35
-        return [
-            angle[0] - float(delta[1]) * 110.0 * gain,
-            angle[1] - float(delta[0]) * 145.0 * gain,
-        ]
+        vertical_comp, horizontal_comp = self._safe_pupil_compensation(delta, stabilizer)
+        return self._safe_final_angle(
+            [
+                angle[0] + vertical_comp,
+                angle[1] + horizontal_comp,
+            ],
+            stabilizer,
+        )
 
     def _eye_is_closed(self, eye_data) -> bool:
         """Detect blink/closed eye; DeepWarp must not draw an open pupil then."""
         return float(getattr(eye_data, "openness", 1.0)) < 0.19
+
+    def _update_blink_state(self, eye_side: str, closed: bool) -> None:
+        now = time.monotonic()
+        was_closed = self.eye_closed_previous.get(eye_side, False)
+        if closed:
+            self.eye_closed_previous[eye_side] = True
+            self.eye_reopen_time[eye_side] = 0.0
+            return
+
+        if was_closed:
+            self.eye_reopen_time[eye_side] = now
+            self.eye_closed_previous[eye_side] = False
+
+    def _reopen_blend_strength(self, eye_side: str) -> float:
+        reopened_at = self.eye_reopen_time.get(eye_side, 0.0)
+        if reopened_at <= 0.0:
+            return 1.0
+
+        age = time.monotonic() - reopened_at
+        if age < 0.045:
+            return 0.0
+        if age >= 0.220:
+            return 1.0
+
+        t = np.clip((age - 0.045) / 0.175, 0.0, 1.0)
+        return float(t * t * (3.0 - 2.0 * t))
 
     def _reset_eye_temporal_state(self, eye_side: str) -> None:
         self.pupil_hold_filter.reset_eye(eye_side)
@@ -1238,14 +1353,14 @@ class GazeCorrector:
         self, image: np.ndarray, delta: np.ndarray, stabilizer: float
     ) -> np.ndarray:
         """Move the generated eye as one piece, preserving pupil/iris shape."""
-        if stabilizer <= 0.01:
+        if stabilizer <= 0.01 or stabilizer >= 0.05:
             return image
 
         img = image.astype(np.float32)
         h, w = img.shape[:2]
         shift_gain = stabilizer ** 1.45
-        shift_x = float(np.clip(-delta[0] * 24.0 * shift_gain, -6.0, 6.0))
-        shift_y = float(np.clip(-delta[1] * 18.0 * shift_gain, -4.5, 4.5))
+        shift_x = float(np.clip(-delta[0] * 8.0 * shift_gain, -1.2, 1.2))
+        shift_y = float(np.clip(-delta[1] * 6.0 * shift_gain, -0.8, 0.8))
         if abs(shift_x) < 0.08 and abs(shift_y) < 0.08:
             return image
 
@@ -1289,7 +1404,9 @@ class GazeCorrector:
         # Resize back to original size
         return cv2.resize(result, (eye_data.original_size[1], eye_data.original_size[0]))
 
-    def _eye_alpha_mask(self, eye_data, output_size: tuple[int, int]) -> np.ndarray:
+    def _eye_alpha_mask(
+        self, eye_data, output_size: tuple[int, int], hold_strength: float = 0.0
+    ) -> np.ndarray:
         """Create a feathered eye-only mask to avoid rectangular DeepWarp artifacts."""
         h, w = output_size
         mask = np.zeros((h, w), dtype=np.float32)
@@ -1317,14 +1434,49 @@ class GazeCorrector:
         if mask.max() <= 0:
             return mask
 
-        dilate = max(2, int(min(h, w) * 0.055))
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (dilate * 2 + 1, dilate * 2 + 1)
+        base = mask.copy()
+        if hold_strength < 0.12:
+            dilate = max(1, int(min(h, w) * 0.026))
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (dilate * 2 + 1, dilate * 2 + 1)
+            )
+            base = cv2.dilate(base, kernel, iterations=1)
+
+        blur = max(7, int(min(h, w) * 0.12) | 1)
+        soft = cv2.GaussianBlur(base, (blur, blur), 0)
+        if hold_strength >= 0.12:
+            soft = np.minimum(soft, mask)
+
+        max_alpha = 0.84 - 0.12 * np.clip(hold_strength, 0.0, 1.0)
+        return np.clip(soft * max_alpha, 0.0, max_alpha)
+
+    def _pupil_safe_mask(
+        self, eye_data, output_size: tuple[int, int], hold_strength: float
+    ) -> np.ndarray:
+        h, w = output_size
+        mask = np.zeros((h, w), dtype=np.float32)
+        input_h, input_w = self.model_cfg.eye_input_size
+        if getattr(eye_data, "pupil_center", None) is not None:
+            cx = float(eye_data.pupil_center[0]) * w / input_w
+            cy = float(eye_data.pupil_center[1]) * h / input_h
+        else:
+            cx = w * 0.50
+            cy = h * 0.53
+
+        axes_x = max(2, int(w * (0.25 - 0.04 * hold_strength)))
+        axes_y = max(2, int(h * (0.30 - 0.05 * hold_strength)))
+        cv2.ellipse(
+            mask,
+            (int(cx), int(cy)),
+            (axes_x, axes_y),
+            0,
+            0,
+            360,
+            1.0,
+            -1,
         )
-        mask = cv2.dilate(mask, kernel, iterations=1)
-        blur = max(7, int(min(h, w) * 0.14) | 1)
-        mask = cv2.GaussianBlur(mask, (blur, blur), 0)
-        return np.clip(mask * 0.92, 0.0, 0.92)
+        blur = max(5, int(min(h, w) * 0.12) | 1)
+        return np.clip(cv2.GaussianBlur(mask, (blur, blur), 0), 0.0, 1.0)
 
     def _sharpen_corrected_eye(self, image: np.ndarray) -> np.ndarray:
         """Recover a little crispness from the low-resolution generated eye crop."""
@@ -1333,7 +1485,35 @@ class GazeCorrector:
         sharpened = cv2.addWeighted(img, 1.28, blurred, -0.28, 0)
         return np.clip(sharpened, 0.0, 1.0)
 
-    def _blend_eye_region(self, frame: np.ndarray, eye_data, corrected_eye: np.ndarray) -> None:
+    def _match_eye_tone(
+        self,
+        corrected: np.ndarray,
+        original: np.ndarray,
+        alpha: np.ndarray,
+        hold_strength: float,
+    ) -> np.ndarray:
+        region = alpha[:, :, 0] > 0.20
+        if int(np.sum(region)) < 12:
+            return corrected
+
+        corrected_matched = corrected.copy()
+        strength = 0.26 + 0.16 * np.clip(hold_strength, 0.0, 1.0)
+        for channel in range(3):
+            c_values = corrected[:, :, channel][region]
+            o_values = original[:, :, channel][region]
+            c_mean = float(np.mean(c_values))
+            o_mean = float(np.mean(o_values))
+            corrected_matched[:, :, channel] += (o_mean - c_mean) * strength
+        return np.clip(corrected_matched, 0.0, 1.0)
+
+    def _blend_eye_region(
+        self,
+        frame: np.ndarray,
+        eye_data,
+        corrected_eye: np.ndarray,
+        hold_strength: float = 0.0,
+        correction_alpha: float = 1.0,
+    ) -> None:
         """Blend the corrected eye through a soft eye contour mask."""
         row, col = eye_data.top_left
         roi_h, roi_w = eye_data.original_size
@@ -1352,14 +1532,31 @@ class GazeCorrector:
         src_right = src_left + (dst_right - dst_left)
 
         corrected = self._sharpen_corrected_eye(corrected_eye)
-        mask = self._eye_alpha_mask(eye_data, eye_data.original_size)
+        mask = self._eye_alpha_mask(eye_data, eye_data.original_size, hold_strength)
+        pupil_safe = self._pupil_safe_mask(eye_data, eye_data.original_size, hold_strength)
 
         corrected_crop = corrected[src_top:src_bottom, src_left:src_right]
         alpha = mask[src_top:src_bottom, src_left:src_right, None]
+        alpha = alpha * np.clip(correction_alpha, 0.0, 1.0)
         original = frame[dst_top:dst_bottom, dst_left:dst_right].astype(np.float32) / 255.0
+        corrected_crop = self._match_eye_tone(
+            corrected_crop,
+            original,
+            alpha,
+            hold_strength,
+        )
 
         corrected_luma = corrected_crop.mean(axis=2)
         original_luma = original.mean(axis=2)
+        safe_crop = pupil_safe[src_top:src_bottom, src_left:src_right]
+        pupil_spill = np.logical_and(
+            hold_strength > 0.10,
+            np.logical_and(corrected_luma < 0.30, safe_crop < 0.18),
+        ).astype(np.float32)
+        if pupil_spill.max() > 0:
+            pupil_spill = cv2.GaussianBlur(pupil_spill, (7, 7), 0)
+            alpha = alpha * (1.0 - pupil_spill[:, :, None] * (0.35 + 0.45 * hold_strength))
+
         dark_artifact = np.logical_and(
             corrected_luma < 0.035,
             original_luma - corrected_luma > 0.16,
@@ -1397,6 +1594,8 @@ class GazeCorrector:
         le_closed = self._eye_is_closed(le)
         re_closed = self._eye_is_closed(re)
 
+        self._update_blink_state("L", le_closed)
+        self._update_blink_state("R", re_closed)
         if le_closed:
             self._reset_eye_temporal_state("L")
         if re_closed:
@@ -1432,13 +1631,19 @@ class GazeCorrector:
             )
 
         if not le_closed:
+            le_blend = self._reopen_blend_strength("L")
             le_alpha = self._angle_with_pupil_delta(alpha, le_delta, hold_strength)
-            le_corrected = self.correct_eye(le, "L", le_alpha, hold_strength, le_delta)
-            self._blend_eye_region(frame, le, le_corrected)
+            le_hold = hold_strength * le_blend
+            if le_blend > 0.01:
+                le_corrected = self.correct_eye(le, "L", le_alpha, le_hold, le_delta)
+                self._blend_eye_region(frame, le, le_corrected, le_hold, le_blend)
         if not re_closed:
+            re_blend = self._reopen_blend_strength("R")
             re_alpha = self._angle_with_pupil_delta(alpha, re_delta, hold_strength)
-            re_corrected = self.correct_eye(re, "R", re_alpha, hold_strength, re_delta)
-            self._blend_eye_region(frame, re, re_corrected)
+            re_hold = hold_strength * re_blend
+            if re_blend > 0.01:
+                re_corrected = self.correct_eye(re, "R", re_alpha, re_hold, re_delta)
+                self._blend_eye_region(frame, re, re_corrected, re_hold, re_blend)
 
         return frame
 

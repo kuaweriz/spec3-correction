@@ -119,6 +119,12 @@ def write_info_plist(contents_dir: Path) -> None:
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": APP_NAME,
         "CFBundlePackageType": "APPL",
+        "CFBundleURLTypes": [
+            {
+                "CFBundleURLName": BUNDLE_ID,
+                "CFBundleURLSchemes": ["spec3correction"],
+            }
+        ],
         "CFBundleShortVersionString": "0.1.0",
         "CFBundleVersion": "1",
         "LSMinimumSystemVersion": "14.0",
