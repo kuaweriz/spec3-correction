@@ -15,6 +15,7 @@
 @property(nonatomic, copy) NSString *logPath;
 @property(nonatomic, copy) NSString *cacheDir;
 @property(nonatomic, copy) NSString *controlPath;
+@property(nonatomic, copy) NSString *cameraListPath;
 @property(nonatomic) BOOL isQuitting;
 @property(nonatomic) BOOL stopRequested;
 @end
@@ -46,10 +47,11 @@
 
     NSString *home = NSHomeDirectory();
     NSString *logDir = [home stringByAppendingPathComponent:@"Library/Logs"];
-    NSString *supportDir = [[home stringByAppendingPathComponent:@"Library/Application Support"] stringByAppendingPathComponent:@"Gaze Correction Camera"];
-    self.logPath = [logDir stringByAppendingPathComponent:@"Gaze Correction Camera.log"];
-    self.cacheDir = [[home stringByAppendingPathComponent:@"Library/Caches"] stringByAppendingPathComponent:@"Gaze Correction Camera/matplotlib"];
+    NSString *supportDir = [[home stringByAppendingPathComponent:@"Library/Application Support"] stringByAppendingPathComponent:@"spec3 correction"];
+    self.logPath = [logDir stringByAppendingPathComponent:@"spec3 correction.log"];
+    self.cacheDir = [[home stringByAppendingPathComponent:@"Library/Caches"] stringByAppendingPathComponent:@"spec3 correction/matplotlib"];
     self.controlPath = [supportDir stringByAppendingPathComponent:@"control.txt"];
+    self.cameraListPath = [supportDir stringByAppendingPathComponent:@"cameras.json"];
 
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:logDir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -64,7 +66,7 @@
         self.logHandle = [NSFileHandle fileHandleForWritingAtPath:self.logPath];
     }
     [self.logHandle seekToEndOfFile];
-    [self logLine:[NSString stringWithFormat:@"\n--- Gaze Correction Camera native start: %@ ---", [NSDate date]]];
+    [self logLine:[NSString stringWithFormat:@"\n--- spec3 correction native start: %@ ---", [NSDate date]]];
 }
 
 - (void)createStatusItem {
@@ -72,9 +74,9 @@
     NSStatusBarButton *button = self.statusItem.button;
     button.image = [self statusIcon];
     button.image.template = YES;
-    button.toolTip = @"Gaze Correction Camera";
+    button.toolTip = @"spec3 correction";
 
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Gaze Correction Camera"];
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"spec3 correction"];
     self.openItem = [[NSMenuItem alloc] initWithTitle:@"Show Window" action:@selector(showWindow:) keyEquivalent:@""];
     self.openItem.target = self;
     [menu addItem:self.openItem];
@@ -140,10 +142,33 @@
 
     if (status != AVAuthorizationStatusAuthorized) {
         [self showAlert:@"Camera access is blocked"
-                message:@"Open System Settings > Privacy & Security > Camera and allow Gaze Correction Camera, then open it again from the menu bar icon."];
+                message:@"Open System Settings > Privacy & Security > Camera and allow spec3 correction, then open it again from the menu bar icon."];
         return NO;
     }
     return YES;
+}
+
+- (void)writeCameraList {
+    NSArray<AVCaptureDevice *> *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+    NSMutableArray *items = [NSMutableArray arrayWithCapacity:devices.count];
+    NSInteger index = 0;
+    for (AVCaptureDevice *device in devices) {
+        NSString *name = device.localizedName ?: [NSString stringWithFormat:@"Camera %ld", (long)index];
+        NSString *uniqueID = device.uniqueID ?: @"";
+        NSString *modelID = device.modelID ?: @"";
+        [items addObject:@{
+            @"id": @(index),
+            @"name": name,
+            @"unique_id": uniqueID,
+            @"model_id": modelID,
+        }];
+        index += 1;
+    }
+
+    NSData *data = [NSJSONSerialization dataWithJSONObject:items options:NSJSONWritingPrettyPrinted error:nil];
+    if (data) {
+        [data writeToFile:self.cameraListPath atomically:YES];
+    }
 }
 
 - (void)startCamera:(id)sender {
@@ -158,7 +183,9 @@
         [self enterMenuBarMode];
         return;
     }
+    [self writeCameraList];
 
+    [[NSFileManager defaultManager] removeItemAtPath:self.controlPath error:nil];
     self.stopRequested = NO;
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
@@ -173,6 +200,8 @@
     env[@"PYTHONNOUSERSITE"] = @"1";
     env[@"MPLCONFIGDIR"] = self.cacheDir;
     env[@"GAZE_CONTROL_FILE"] = self.controlPath;
+    env[@"SPEC3_SUPPORT_DIR"] = [self.controlPath stringByDeletingLastPathComponent];
+    env[@"SPEC3_CAMERA_LIST_FILE"] = self.cameraListPath;
     [newTask setEnvironment:env];
     [newTask setStandardOutput:self.logHandle];
     [newTask setStandardError:self.logHandle];
@@ -193,7 +222,7 @@
     } @catch (NSException *exception) {
         NSString *message = [NSString stringWithFormat:@"Could not launch Python runtime: %@", [exception reason]];
         [self logLine:message];
-        [self showAlert:@"Gaze Correction Camera could not start" message:message];
+        [self showAlert:@"spec3 correction could not start" message:message];
         self.task = nil;
         [self enterMenuBarMode];
     }
@@ -253,8 +282,8 @@
     [self enterMenuBarMode];
 
     if (!expectedExit) {
-        [self showAlert:@"Gaze Correction Camera could not start"
-                message:@"Check the log at ~/Library/Logs/Gaze Correction Camera.log. The app will stay in the menu bar so you can try opening it again."];
+        [self showAlert:@"spec3 correction could not start"
+                message:@"Check the log at ~/Library/Logs/spec3 correction.log. The app will stay in the menu bar so you can try opening it again."];
     }
 }
 

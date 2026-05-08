@@ -18,6 +18,7 @@ Controls:
 import cv2
 from displayers.dis_single_window import SingleWindowGazeCorrector, DisplayConfig
 from displayers.face_predictor import create_face_predictor
+from utils.camera_selection import choose_camera_id
 
 
 def detect_camera_resolution(camera_id: int) -> tuple[int, int]:
@@ -30,14 +31,23 @@ def detect_camera_resolution(camera_id: int) -> tuple[int, int]:
     Returns:
         Tuple of (width, height) in pixels
     """
-    cap = cv2.VideoCapture(camera_id)
+    cap = None
+    if hasattr(cv2, "CAP_AVFOUNDATION"):
+        cap = cv2.VideoCapture(camera_id, cv2.CAP_AVFOUNDATION)
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        cap = cv2.VideoCapture(camera_id)
     if not cap.isOpened():
         print(f"Warning: Could not open camera {camera_id}, using default resolution")
         return (640, 480)
-    
-    # Get the actual resolution
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    ret, frame = cap.read()
+    if ret and frame is not None:
+        height, width = frame.shape[:2]
+    else:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
     
     print(f"Detected camera resolution: {width}x{height}")
@@ -72,8 +82,8 @@ Examples:
     parser.add_argument(
         "--camera",
         type=int,
-        default=0,
-        help="Camera device ID (default: 0)",
+        default=-1,
+        help="Camera device ID (default: auto-select physical camera)",
     )
     parser.add_argument(
         "--config",
@@ -83,8 +93,10 @@ Examples:
     )
     args = parser.parse_args()
 
+    camera_id = choose_camera_id(args.camera)
+
     # Detect camera resolution
-    video_size = detect_camera_resolution(args.camera)
+    video_size = detect_camera_resolution(camera_id)
     
     # Calculate appropriate face detection size (half resolution)
     face_detect_size = (video_size[0] // 2, video_size[1] // 2)
@@ -104,7 +116,7 @@ Examples:
     corrector = SingleWindowGazeCorrector(
         face_predictor=predictor,
         display_config=display_config,
-        camera_id=args.camera,
+        camera_id=camera_id,
         config_path=args.config,
     )
     corrector.run()
