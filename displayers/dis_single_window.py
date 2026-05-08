@@ -9,13 +9,33 @@ A simplified gaze correction application that:
 - Calibration mode for camera offset adjustment
 """
 
+from __future__ import annotations
+
 import os
+import math
+import threading
+import time
 import cv2
 import numpy as np
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # pragma: no cover - OpenCV fallback for minimal installs
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
 from utils.logger import Logger
+from utils.camera_selection import (
+    CameraInfo,
+    camera_name,
+    is_virtual_camera_name,
+    list_macos_cameras,
+    save_camera_id,
+)
 from displayers.face_predictor import (
     FacePredictor,
     EyeExtractionConfig,
@@ -29,13 +49,71 @@ from model_managers.gaze_corrector_v1 import GazeCorrector
 ################################################################################
 
 
+UI_FONT_REGULAR = "/System/Library/Fonts/SFNS.ttf"
+UI_FONT_BOLD = "/System/Library/Fonts/SFNS.ttf"
+
+
+@lru_cache(maxsize=32)
+def _load_ui_font(size: int, bold: bool = False):
+    if ImageFont is None:
+        return None
+    font_path = UI_FONT_BOLD if bold else UI_FONT_REGULAR
+    try:
+        return ImageFont.truetype(font_path, size=size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+@lru_cache(maxsize=1024)
+def _measure_ui_text(text: str, size: int, bold: bool = False) -> tuple[int, int]:
+    font = _load_ui_font(size, bold)
+    if font is not None and Image is not None and ImageDraw is not None:
+        try:
+            scratch = Image.new("RGBA", (1, 1))
+            draw = ImageDraw.Draw(scratch)
+            bbox = draw.textbbox((0, 0), text, font=font, anchor="ls")
+            return bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except Exception:
+            pass
+    scale = size / 34.0
+    return cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0]
+
+
+@lru_cache(maxsize=1024)
+def _render_ui_text_patch(
+    text: str,
+    size: int,
+    color: tuple[int, int, int],
+    bold: bool = False,
+) -> tuple[np.ndarray, int, int] | None:
+    font = _load_ui_font(size, bold)
+    if font is None or Image is None or ImageDraw is None:
+        return None
+
+    try:
+        scratch = Image.new("RGBA", (1, 1))
+        draw = ImageDraw.Draw(scratch)
+        bbox = draw.textbbox((0, 0), text, font=font, anchor="ls")
+    except Exception:
+        return None
+
+    pad = 3
+    patch_w = max(1, bbox[2] - bbox[0] + pad * 2)
+    patch_h = max(1, bbox[3] - bbox[1] + pad * 2)
+    patch = Image.new("RGBA", (patch_w, patch_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(patch)
+    rgb = (int(color[2]), int(color[1]), int(color[0]), 255)
+    draw.text((pad - bbox[0], pad - bbox[1]), text, font=font, fill=rgb, anchor="ls")
+    return np.asarray(patch, dtype=np.float32), bbox[0] - pad, bbox[1] - pad
+
+
 @dataclass
 class DisplayConfig:
     """Configuration for the display application."""
 
     video_size: tuple[int, int] = (640, 480)
     face_detect_size: tuple[int, int] = (320, 240)
-    window_name: str = "SpecTree"
+    window_name: str = "spec3 correction"
 
     @property
     def x_ratio(self) -> float:
@@ -132,6 +210,23 @@ class SingleWindowGazeCorrector:
         self._last_control_mtime = 0.0
         self._pending_hide_window = False
         self._pending_show_window = False
+        self._preview_region: tuple[int, int, int, int] | None = None
+        self._dragging_preview_aim = False
+        self._aim_target_offsets: tuple[float, float] | None = None
+        self._aim_applied_offsets: tuple[float, float] | None = None
+        self._aim_save_when_settled = False
+        self._last_aim_update = time.monotonic()
+        self._aim_visible_until = 0.0
+        self._pending_camera_id: Optional[int] = None
+        self._pending_camera_label = ""
+        self.camera_dropdown_open = False
+        self.camera_options: list[CameraInfo] = []
+        self.camera_label = f"Camera {self.camera_id}"
+        self._camera_refresh_lock = threading.Lock()
+        self._camera_refreshing = False
+        self._camera_options_refreshed_at = 0.0
+        self._camera_refresh_interval = 8.0
+        self.refresh_camera_options()
 
         # Store default values for reset
         self.default_camera_offset = self.gaze_corrector.get_camera_offset()
@@ -180,6 +275,10 @@ class SingleWindowGazeCorrector:
         self._window_created = False
         self._last_canvas_size = None
         self._dragging_control = None
+        self._dragging_preview_aim = False
+        self._aim_target_offsets = None
+        self._aim_applied_offsets = None
+        self._aim_save_when_settled = False
         self._slider_regions.clear()
         self._button_regions.clear()
         if not already_closed:
@@ -188,6 +287,130 @@ class SingleWindowGazeCorrector:
                 cv2.waitKey(1)
             except cv2.error:
                 pass
+
+    def _apply_camera_options(
+        self,
+        cameras: list[CameraInfo],
+        *,
+        refresh_finished: bool = False,
+    ) -> None:
+        """Update the camera list without blocking the UI thread."""
+        with self._camera_refresh_lock:
+            if cameras:
+                self.camera_options = list(cameras)
+            elif not self.camera_options:
+                self.camera_options = [CameraInfo(self.camera_id, f"Camera {self.camera_id}")]
+
+            active_id = self._pending_camera_id if self._pending_camera_id is not None else self.camera_id
+            if all(camera.id != active_id for camera in self.camera_options):
+                self.camera_options.append(CameraInfo(active_id, f"Camera {active_id}"))
+
+            self.camera_label = camera_name(active_id, self.camera_options)
+            self._camera_options_refreshed_at = time.monotonic()
+            if refresh_finished:
+                self._camera_refreshing = False
+
+    def _start_camera_refresh(self, force: bool = False) -> None:
+        with self._camera_refresh_lock:
+            if self._camera_refreshing:
+                return
+            self._camera_refreshing = True
+
+        def worker() -> None:
+            cameras = list_macos_cameras(force_refresh=force)
+            self._apply_camera_options(cameras, refresh_finished=True)
+
+        threading.Thread(target=worker, name="spec3-camera-refresh", daemon=True).start()
+
+    def refresh_camera_options(self, force: bool = False, async_refresh: bool = False) -> None:
+        """Refresh camera names shown in the in-app selector."""
+        with self._camera_refresh_lock:
+            is_fresh = (
+                bool(self.camera_options)
+                and time.monotonic() - self._camera_options_refreshed_at < self._camera_refresh_interval
+            )
+        if not force and is_fresh:
+            return
+
+        if async_refresh:
+            self._start_camera_refresh(force=force)
+            return
+
+        self._apply_camera_options(list_macos_cameras(force_refresh=force))
+
+    def toggle_camera_dropdown(self) -> None:
+        self.camera_dropdown_open = not self.camera_dropdown_open
+        if self.camera_dropdown_open:
+            self.refresh_camera_options(force=False, async_refresh=True)
+
+    def request_camera_select(self, camera_id: int, label: str) -> None:
+        """Queue a camera switch from the UI; applied in the main loop."""
+        self.camera_dropdown_open = False
+        self.camera_label = label
+        if camera_id != self.camera_id:
+            self._pending_camera_id = camera_id
+            self._pending_camera_label = label
+
+    def _short_camera_label(self, max_chars: int = 25) -> str:
+        label = self.camera_label.replace("\xa0", " ")
+        return label if len(label) <= max_chars else label[: max_chars - 3].rstrip() + "..."
+
+    def _fit_text(self, text: str, max_width: int, size: int, bold: bool = False) -> str:
+        if self._measure_text(text, size, bold)[0] <= max_width:
+            return text
+        trimmed = text
+        while len(trimmed) > 4:
+            trimmed = trimmed[:-1].rstrip()
+            candidate = trimmed + "..."
+            if self._measure_text(candidate, size, bold)[0] <= max_width:
+                return candidate
+        return "..."
+
+    def _measure_text(self, text: str, size: int, bold: bool = False) -> tuple[int, int]:
+        return _measure_ui_text(text, size, bold)
+
+    def _draw_text(
+        self,
+        image: np.ndarray,
+        text: str,
+        org: tuple[int, int],
+        size: int,
+        color: tuple[int, int, int],
+        bold: bool = False,
+    ) -> None:
+        """Draw sharper macOS text with a safe OpenCV fallback."""
+        rendered = _render_ui_text_patch(text, size, tuple(color), bold)
+        if rendered is None:
+            scale = size / 34.0
+            thickness = 2 if bold else 1
+            cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+            return
+
+        x, y = org
+        patch_np, offset_x, offset_y = rendered
+        left = x + offset_x
+        top = y + offset_y
+        right = left + patch_np.shape[1]
+        bottom = top + patch_np.shape[0]
+
+        dst_left = max(left, 0)
+        dst_top = max(top, 0)
+        dst_right = min(right, image.shape[1])
+        dst_bottom = min(bottom, image.shape[0])
+        if dst_right <= dst_left or dst_bottom <= dst_top:
+            return
+
+        src_x1 = dst_left - left
+        src_y1 = dst_top - top
+        src_x2 = src_x1 + (dst_right - dst_left)
+        src_y2 = src_y1 + (dst_bottom - dst_top)
+        src = patch_np[src_y1:src_y2, src_x1:src_x2]
+        alpha = src[:, :, 3:4] / 255.0
+        color_bgr = src[:, :, :3][:, :, ::-1]
+        roi = image[dst_top:dst_bottom, dst_left:dst_right].astype(np.float32)
+        image[dst_top:dst_bottom, dst_left:dst_right] = np.clip(
+            color_bgr * alpha + roi * (1.0 - alpha), 0, 255
+        ).astype(np.uint8)
 
     def set_correction_enabled(self, enabled: bool) -> None:
         self.gaze_correction_enabled = enabled
@@ -244,7 +467,10 @@ class SingleWindowGazeCorrector:
 
         preview_y = (canvas_h - preview_h) // 2
         canvas[preview_y:preview_y + preview_h, 0:preview_w] = preview
+        self._preview_region = (0, preview_y, preview_w, preview_y + preview_h)
+        self._update_preview_aim_motion()
         cv2.rectangle(canvas, (0, preview_y), (preview_w - 1, preview_y + preview_h - 1), (44, 49, 58), 1)
+        self._draw_preview_aim_overlay(canvas)
 
         self._panel_origin_x = preview_w
         cv2.line(canvas, (preview_w, 0), (preview_w, canvas_h), (54, 60, 72), 1, cv2.LINE_AA)
@@ -283,21 +509,32 @@ class SingleWindowGazeCorrector:
         title_x = x0 + 28
         cv2.circle(canvas, (title_x + 6, 36), 5, accent, -1, cv2.LINE_AA)
         cv2.circle(canvas, (title_x + 6, 36), 9, (54, 56, 87), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "SpecTree", (title_x + 22, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.82, text, 2, cv2.LINE_AA)
-        cv2.putText(canvas, "Live gaze control", (title_x + 24, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.43, muted, 1, cv2.LINE_AA)
+        self._draw_text(canvas, "spec3 correction", (title_x + 22, 43), 30, text, bold=True)
+        self._draw_text(canvas, "Live gaze control", (title_x + 24, 70), 15, muted)
 
         on_label = "ON" if tuning.enabled and self.gaze_correction_enabled else "OFF"
         self._draw_button(canvas, "toggle", (x0 + 292, 24, x0 + 392, 62), on_label, tuning.enabled and self.gaze_correction_enabled)
 
+        camera_y1, camera_y2 = 106, 150
+        cv2.rectangle(canvas, (x0 + 28, camera_y1), (x0 + 392, camera_y2), card_bg, -1)
+        cv2.rectangle(canvas, (x0 + 28, camera_y1), (x0 + 392, camera_y2), (58, 62, 74), 1)
+        cv2.rectangle(canvas, (x0 + 28, camera_y1), (x0 + 33, camera_y2), (74, 82, 96), -1)
+        self._draw_text(canvas, "Camera", (x0 + 46, camera_y1 + 28), 16, muted, bold=True)
+        camera_text = self._fit_text(self._short_camera_label(40), 218, 16)
+        self._draw_text(canvas, camera_text, (x0 + 118, camera_y1 + 28), 16, text)
+        self._draw_text(canvas, "v", (x0 + 369, camera_y1 + 27), 15, muted, bold=True)
+        self._button_regions["camera_toggle"] = (x0 + 28, camera_y1, x0 + 392, camera_y2)
+
         mode_label = "READ" if reading_active else "LIVE"
         mode_color = accent if reading_active else live_accent
-        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 392, 178), card_bg, -1)
-        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 392, 178), card_line, 1)
-        cv2.rectangle(canvas, (x0 + 28, 112), (x0 + 33, 178), mode_color, -1)
-        cv2.putText(canvas, "Adaptive mode", (x0 + 46, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (218, 223, 232), 1, cv2.LINE_AA)
-        cv2.putText(canvas, mode_label, (x0 + 298, 139), cv2.FONT_HERSHEY_SIMPLEX, 0.58, mode_color, 2, cv2.LINE_AA)
-        self._draw_meter(canvas, x0 + 46, 158, x0 + 216, reading_score, "read")
-        self._draw_meter(canvas, x0 + 230, 158, x0 + 374, effective_hold, "hold")
+        mode_y1, mode_y2 = 164, 224
+        cv2.rectangle(canvas, (x0 + 28, mode_y1), (x0 + 392, mode_y2), card_bg, -1)
+        cv2.rectangle(canvas, (x0 + 28, mode_y1), (x0 + 392, mode_y2), card_line, 1)
+        cv2.rectangle(canvas, (x0 + 28, mode_y1), (x0 + 33, mode_y2), mode_color, -1)
+        self._draw_text(canvas, "Adaptive mode", (x0 + 46, mode_y1 + 27), 17, (218, 223, 232))
+        self._draw_text(canvas, mode_label, (x0 + 298, mode_y1 + 27), 20, mode_color, bold=True)
+        self._draw_meter(canvas, x0 + 46, mode_y1 + 45, x0 + 216, reading_score, "read")
+        self._draw_meter(canvas, x0 + 230, mode_y1 + 45, x0 + 374, effective_hold, "hold")
 
         sliders = [
             ("strength", "Strength", tuning.strength * 100.0, 0.0, 150.0, "%"),
@@ -310,22 +547,201 @@ class SingleWindowGazeCorrector:
 
         track_x1 = x0 + 34
         track_x2 = x0 + 286
-        y = 220
+        y = 258
         for key, label, value, min_value, max_value, suffix in sliders:
             self._draw_slider(canvas, key, label, value, min_value, max_value, suffix, y, track_x1, track_x2)
-            y += 58
+            y += 56
 
-        button_y = min(height - 94, 608)
+        button_y = min(height - 94, 612)
         self._draw_button(canvas, "reading", (x0 + 28, button_y, x0 + 186, button_y + 42), "Reading Preset", reading_active)
         self._draw_button(canvas, "reset", (x0 + 202, button_y, x0 + 292, button_y + 42), "Reset", False)
         self._draw_button(canvas, "quit", (x0 + 308, button_y, x0 + 392, button_y + 42), "Hide", False, danger=True)
 
         footer_y = min(height - 28, button_y + 78)
-        cv2.putText(canvas, f"Menu bar controls window and correction", (x0 + 28, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (138, 147, 160), 1, cv2.LINE_AA)
+        self._draw_text(canvas, "Menu bar controls window and correction", (x0 + 28, footer_y), 12, (138, 147, 160))
+        if self.camera_dropdown_open:
+            self._draw_camera_dropdown(canvas, x0, camera_y2 + 6)
+
+    def _draw_camera_dropdown(self, canvas: np.ndarray, x0: int, y: int) -> None:
+        """Draw the camera dropdown over the rest of the control panel."""
+        with self._camera_refresh_lock:
+            camera_options = list(self.camera_options)
+            camera_refreshing = self._camera_refreshing
+
+        x1 = x0 + 28
+        x2 = x0 + 392
+        row_h = 36
+        max_rows = min(len(camera_options), 6) if camera_options else 1
+        dropdown_h = max(1, max_rows) * row_h + 10
+        bottom = y + dropdown_h
+
+        cv2.rectangle(canvas, (x1 + 4, y + 5), (x2 + 4, bottom + 5), (9, 10, 13), -1)
+        cv2.rectangle(canvas, (x1, y), (x2, bottom), (24, 24, 30), -1)
+        cv2.rectangle(canvas, (x1, y), (x2, bottom), (82, 86, 98), 1)
+
+        if not camera_options:
+            label = "Scanning cameras..." if camera_refreshing else "No cameras found"
+            self._draw_text(canvas, label, (x1 + 18, y + 28), 15, (218, 222, 230))
+            return
+
+        for index, camera in enumerate(camera_options[:max_rows]):
+            row_y1 = y + 5 + index * row_h
+            row_y2 = row_y1 + row_h
+            active = camera.id == self.camera_id
+            hover_bg = (39, 37, 34) if not active else (48, 41, 35)
+            cv2.rectangle(canvas, (x1 + 6, row_y1), (x2 - 6, row_y2), hover_bg, -1)
+            if active:
+                cv2.circle(canvas, (x1 + 20, row_y1 + 18), 5, (43, 132, 255), -1, cv2.LINE_AA)
+
+            name = self._fit_text(camera.name, 250, 15, bold=active)
+            name_color = (248, 248, 250) if active else (218, 222, 230)
+            self._draw_text(canvas, name, (x1 + 34, row_y1 + 23), 15, name_color, bold=active)
+            id_text = f"#{camera.id}"
+            self._draw_text(canvas, id_text, (x2 - 38, row_y1 + 23), 13, (146, 152, 164))
+            self._button_regions[f"camera_option:{camera.id}"] = (x1 + 6, row_y1, x2 - 6, row_y2)
+
+    def _clamp_to_preview(self, x: int, y: int) -> tuple[int, int] | None:
+        if self._preview_region is None:
+            return None
+
+        x1, y1, x2, y2 = self._preview_region
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return max(x1, min(x, x2 - 1)), max(y1, min(y, y2 - 1))
+
+    def _is_inside_preview(self, x: int, y: int) -> bool:
+        if self._preview_region is None:
+            return False
+        x1, y1, x2, y2 = self._preview_region
+        return x1 <= x < x2 and y1 <= y < y2
+
+    def _preview_point_to_offsets(self, x: int, y: int) -> tuple[float, float] | None:
+        point = self._clamp_to_preview(x, y)
+        if point is None or self._preview_region is None:
+            return None
+
+        px, py = point
+        x1, y1, x2, y2 = self._preview_region
+        nx = ((px - x1) / max(1, x2 - x1 - 1) - 0.5) * 2.0
+        ny = ((py - y1) / max(1, y2 - y1 - 1) - 0.5) * 2.0
+        nx = math.copysign(abs(nx) ** 1.18, nx)
+        ny = math.copysign(abs(ny) ** 1.18, ny)
+        horizontal = max(-45.0, min(nx * 45.0, 45.0))
+        vertical = max(-90.0, min(-ny * 90.0, 90.0))
+        return vertical, horizontal
+
+    def _offsets_to_preview_point(self, offsets: tuple[float, float] | None = None) -> tuple[int, int] | None:
+        if self._preview_region is None:
+            return None
+
+        if offsets is None:
+            tuning = self.gaze_corrector.get_tuning()
+            offsets = (tuning.vertical_offset, tuning.horizontal_offset)
+        x1, y1, x2, y2 = self._preview_region
+        nx = max(-1.0, min(offsets[1] / 45.0, 1.0))
+        ny = max(-1.0, min(-offsets[0] / 90.0, 1.0))
+        nx = math.copysign(abs(nx) ** (1.0 / 1.18), nx)
+        ny = math.copysign(abs(ny) ** (1.0 / 1.18), ny)
+        x = int(x1 + (nx * 0.5 + 0.5) * max(1, x2 - x1 - 1))
+        y = int(y1 + (ny * 0.5 + 0.5) * max(1, y2 - y1 - 1))
+        return x, y
+
+    def _set_gaze_from_preview_point(self, x: int, y: int, save: bool) -> None:
+        offsets = self._preview_point_to_offsets(x, y)
+        if offsets is None:
+            return
+
+        self._aim_target_offsets = offsets
+        self._aim_visible_until = time.monotonic() + 1.2
+        if self._aim_applied_offsets is None:
+            tuning = self.gaze_corrector.get_tuning()
+            self._aim_applied_offsets = (tuning.vertical_offset, tuning.horizontal_offset)
+
+        if save:
+            self._aim_save_when_settled = True
+
+    def _update_preview_aim_motion(self, force: bool = False, save: bool = False) -> None:
+        if self._aim_target_offsets is None:
+            return
+
+        now = time.monotonic()
+        dt = max(1.0 / 120.0, min(now - self._last_aim_update, 0.10))
+        self._last_aim_update = now
+
+        if self._aim_applied_offsets is None:
+            tuning = self.gaze_corrector.get_tuning()
+            self._aim_applied_offsets = (tuning.vertical_offset, tuning.horizontal_offset)
+
+        current = self._aim_applied_offsets
+        target = self._aim_target_offsets
+        if force:
+            next_offsets = target
+        else:
+            response = 0.070 if self._dragging_preview_aim else 0.095
+            alpha = 1.0 - math.exp(-dt / response)
+            raw_next = (
+                current[0] * (1.0 - alpha) + target[0] * alpha,
+                current[1] * (1.0 - alpha) + target[1] * alpha,
+            )
+            max_vertical_step = 2.8 * max(0.5, min(dt * 60.0, 1.7))
+            max_horizontal_step = 1.8 * max(0.5, min(dt * 60.0, 1.7))
+            next_offsets = (
+                current[0] + max(-max_vertical_step, min(raw_next[0] - current[0], max_vertical_step)),
+                current[1] + max(-max_horizontal_step, min(raw_next[1] - current[1], max_horizontal_step)),
+            )
+
+        if (
+            not force
+            and abs(next_offsets[0] - current[0]) < 0.025
+            and abs(next_offsets[1] - current[1]) < 0.025
+        ):
+            return
+
+        self._aim_applied_offsets = next_offsets
+        self.gaze_corrector.set_tuning(
+            vertical_offset=next_offsets[0],
+            horizontal_offset=next_offsets[1],
+            save=save,
+            reset_tracking=False,
+        )
+
+        if save or (
+            not self._dragging_preview_aim
+            and abs(next_offsets[0] - target[0]) < 0.08
+            and abs(next_offsets[1] - target[1]) < 0.08
+        ):
+            if self._aim_save_when_settled:
+                self.gaze_corrector.save_tuning_settings()
+                self._aim_save_when_settled = False
+            self._aim_target_offsets = None
+            self._aim_applied_offsets = None
+
+    def _draw_preview_aim_overlay(self, canvas: np.ndarray) -> None:
+        if not self._dragging_preview_aim and time.monotonic() > self._aim_visible_until:
+            return
+
+        point = self._offsets_to_preview_point()
+        if point is None or self._preview_region is None:
+            return
+
+        x, y = point
+        color = (255, 148, 72) if self._dragging_preview_aim else (232, 178, 92)
+        shadow = (12, 13, 16)
+
+        if self._aim_target_offsets is not None:
+            target_point = self._offsets_to_preview_point(self._aim_target_offsets)
+            if target_point is not None:
+                tx, ty = target_point
+                cv2.circle(canvas, (tx, ty), 4, shadow, -1, cv2.LINE_AA)
+                cv2.circle(canvas, (tx, ty), 3, color, -1, cv2.LINE_AA)
+
+        cv2.circle(canvas, (x, y), 7, shadow, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (x, y), 5, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (x, y), 10, color, 1, cv2.LINE_AA)
 
     def _draw_meter(self, panel: np.ndarray, x1: int, y: int, x2: int, value: float, label: str) -> None:
         value = max(0.0, min(value, 1.0))
-        cv2.putText(panel, label, (x1, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (148, 157, 170), 1, cv2.LINE_AA)
+        self._draw_text(panel, label, (x1, y - 8), 12, (148, 157, 170))
         cv2.line(panel, (x1 + 44, y - 11), (x2, y - 11), (64, 70, 84), 5, cv2.LINE_AA)
         fill_x = int((x1 + 44) + value * (x2 - (x1 + 44)))
         cv2.line(panel, (x1 + 44, y - 11), (fill_x, y - 11), (43, 132, 255), 5, cv2.LINE_AA)
@@ -367,15 +783,15 @@ class SingleWindowGazeCorrector:
         cv2.rectangle(panel, (x1, y1), (x2, y2), color, -1)
         cv2.line(panel, (x1 + 1, y1), (x2 - 1, y1), tuple(min(c + 24, 255) for c in color), 1, cv2.LINE_AA)
         cv2.rectangle(panel, (x1, y1), (x2, y2), border, 1)
-        scale = 0.55
-        while scale > 0.34:
-            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0]
+        font_size = 18
+        while font_size > 12:
+            text_size = self._measure_text(label, font_size)
             if text_size[0] <= x2 - x1 - 14:
                 break
-            scale -= 0.04
+            font_size -= 1
         tx = x1 + (x2 - x1 - text_size[0]) // 2
         ty = y1 + (y2 - y1 + text_size[1]) // 2
-        cv2.putText(panel, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, 1, cv2.LINE_AA)
+        self._draw_text(panel, label, (tx, ty), font_size, text_color, bold=active)
         self._button_regions[key] = rect
 
     def _draw_slider(
@@ -396,9 +812,9 @@ class SingleWindowGazeCorrector:
         ratio = 0.0 if max_value == min_value else (value - min_value) / (max_value - min_value)
         knob_x = int(x1 + ratio * (x2 - x1))
 
-        cv2.putText(panel, label, (x1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (224, 229, 238), 1, cv2.LINE_AA)
+        self._draw_text(panel, label, (x1, y), 17, (224, 229, 238))
         value_text = f"{value:+.0f}{suffix}" if min_value < 0 else f"{value:.0f}{suffix}"
-        cv2.putText(panel, value_text, (x2 + 18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (91, 178, 255), 1, cv2.LINE_AA)
+        self._draw_text(panel, value_text, (x2 + 18, y), 16, (91, 178, 255), bold=True)
         cv2.line(panel, (x1, track_y), (x2, track_y), (58, 62, 72), 8, cv2.LINE_AA)
         fill_color = (43, 132, 255)
         if min_value < 0 < max_value:
@@ -422,6 +838,15 @@ class SingleWindowGazeCorrector:
                     self._handle_button(key)
                     return
 
+            if self.camera_dropdown_open:
+                self.camera_dropdown_open = False
+                return
+
+            if self._is_inside_preview(x, y):
+                self._dragging_preview_aim = True
+                self._set_gaze_from_preview_point(x, y, save=False)
+                return
+
             for key, region in self._slider_regions.items():
                 x1, track_y, x2, _min_value, _max_value = region
                 if x1 - 16 <= x <= x2 + 16 and track_y - 18 <= y <= track_y + 18:
@@ -429,18 +854,36 @@ class SingleWindowGazeCorrector:
                     self._set_slider_from_x(key, x, save=False)
                     return
 
-        elif event == cv2.EVENT_MOUSEMOVE and self._dragging_control:
-            self._set_slider_from_x(self._dragging_control, x, save=False)
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if self._dragging_preview_aim:
+                self._set_gaze_from_preview_point(x, y, save=False)
+            elif self._dragging_control:
+                self._set_slider_from_x(self._dragging_control, x, save=False)
 
         elif event == cv2.EVENT_LBUTTONUP:
-            if self._dragging_control:
+            if self._dragging_preview_aim:
+                self._set_gaze_from_preview_point(x, y, save=True)
+            elif self._dragging_control:
                 self._set_slider_from_x(self._dragging_control, x, save=True)
+            self._dragging_preview_aim = False
             self._dragging_control = None
 
     def _handle_button(self, key: str) -> None:
         if key == "toggle":
             self.gaze_correction_enabled = not self.gaze_correction_enabled
             self.gaze_corrector.set_tuning(enabled=self.gaze_correction_enabled)
+        elif key == "camera_toggle":
+            self.toggle_camera_dropdown()
+            return
+        elif key.startswith("camera_option:"):
+            try:
+                camera_id = int(key.split(":", 1)[1])
+            except ValueError:
+                return
+            camera = next((item for item in self.camera_options if item.id == camera_id), None)
+            if camera is not None:
+                self.request_camera_select(camera.id, camera.name)
+            return
         elif key == "quit":
             self.request_hide_window()
             return
@@ -459,7 +902,7 @@ class SingleWindowGazeCorrector:
         ratio = max(0.0, min((x - x1) / (x2 - x1), 1.0))
         value = min_value + ratio * (max_value - min_value)
 
-        kwargs = {"save": save}
+        kwargs = {"save": save, "reset_tracking": save}
         if key == "strength":
             kwargs["strength"] = value / 100.0
         elif key == "vertical":
@@ -480,10 +923,10 @@ class SingleWindowGazeCorrector:
         tuning = self.gaze_corrector.get_tuning()
         reading_active, reading_score, effective_hold = self.gaze_corrector.get_reading_state()
         status = "GAZE ON" if self.gaze_correction_enabled and tuning.enabled else "GAZE OFF"
-        color = (43, 132, 255) if self.gaze_correction_enabled and tuning.enabled else (0, 0, 255)
+        color = (0, 255, 0) if self.gaze_correction_enabled and tuning.enabled else (0, 0, 255)
 
         mode = "READ" if reading_active else "LIVE"
-        mode_color = (43, 132, 255) if reading_active else (232, 178, 92)
+        mode_color = (88, 220, 130) if reading_active else (120, 190, 255)
 
         cv2.rectangle(frame, (10, 10), (315, 138), (0, 0, 0), -1)
         cv2.putText(
@@ -727,26 +1170,117 @@ class SingleWindowGazeCorrector:
 
         return display_frame
 
+    def _open_camera_capture(self, camera_id: Optional[int] = None):
+        """Open the camera with the most reliable backend for macOS."""
+        camera_id = self.camera_id if camera_id is None else camera_id
+        backends: list[tuple[str, int | None]] = []
+        if hasattr(cv2, "CAP_AVFOUNDATION"):
+            backends.append(("AVFoundation", cv2.CAP_AVFOUNDATION))
+        backends.append(("default", None))
+
+        for backend_name, backend in backends:
+            cap = (
+                cv2.VideoCapture(camera_id, backend)
+                if backend is not None
+                else cv2.VideoCapture(camera_id)
+            )
+            if not cap.isOpened():
+                cap.release()
+                self.logger.log(f"Camera {camera_id} did not open with {backend_name}")
+                continue
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.display_cfg.video_size[0])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.display_cfg.video_size[1])
+            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            has_frame = False
+            for _ in range(18):
+                ret, test_frame = cap.read()
+                if ret and test_frame is not None:
+                    has_frame = True
+                    break
+                time.sleep(0.04)
+            if not has_frame:
+                cap.release()
+                self.logger.log(f"Camera {camera_id} opened with {backend_name} but returned no frames")
+                continue
+
+            self.logger.log(f"Camera {camera_id} opened with {backend_name}")
+            return cap
+
+        return None
+
+    def _update_video_size_from_frame(self, frame: np.ndarray) -> None:
+        frame_h, frame_w = frame.shape[:2]
+        video_size = (frame_w, frame_h)
+        if self.display_cfg.video_size == video_size:
+            return
+
+        self.display_cfg.video_size = video_size
+        self.display_cfg.face_detect_size = (max(1, frame_w // 2), max(1, frame_h // 2))
+        self._last_canvas_size = None
+        self.logger.log(f"Video size updated to {frame_w}x{frame_h}")
+
+    def _apply_pending_camera_switch(self, cap):
+        if self._pending_camera_id is None:
+            return cap
+
+        next_camera_id = self._pending_camera_id
+        requested_label = self._pending_camera_label
+        self._pending_camera_id = None
+        self._pending_camera_label = ""
+        if next_camera_id == self.camera_id:
+            return cap
+
+        self.logger.log(f"Switching camera {self.camera_id} -> {next_camera_id}")
+        next_cap = self._open_camera_capture(next_camera_id)
+        if next_cap is None:
+            self.logger.log(f"Could not switch to camera {next_camera_id}")
+            self.camera_label = camera_name(self.camera_id, self.camera_options)
+            self.refresh_camera_options(force=True, async_refresh=True)
+            return cap
+
+        cap.release()
+        self.camera_id = next_camera_id
+        self.camera_label = requested_label or camera_name(self.camera_id, self.camera_options)
+        if not is_virtual_camera_name(self.camera_label):
+            save_camera_id(self.camera_id, self.camera_label)
+        self.refresh_camera_options(force=False, async_refresh=True)
+        self.gaze_corrector.reset_tracking()
+        return next_cap
+
     def run(self):
         """Main application loop."""
         self.logger.log(f"Starting camera {self.camera_id}...")
-        cap = cv2.VideoCapture(self.camera_id)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.display_cfg.video_size[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.display_cfg.video_size[1])
+        cap = self._open_camera_capture()
+        if cap is None:
+            self.logger.log(f"Could not open camera {self.camera_id}")
+            return
 
         self.create_settings_panel()
         self.logger.log("Press 'g' to toggle gaze, 'c' for calibration, 'q' to hide")
 
+        failed_reads = 0
         while True:
             self.process_control_command()
             self.apply_pending_window_actions()
+            cap = self._apply_pending_camera_switch(cap)
             if self.should_quit:
                 break
 
             ret, frame = cap.read()
             if not ret:
-                self.logger.log("Failed to read frame")
+                failed_reads += 1
+                if failed_reads <= 60:
+                    if failed_reads == 1:
+                        self.logger.log("Camera returned an empty frame; waiting briefly")
+                    time.sleep(0.03)
+                    continue
+                self.logger.log("Failed to read frame after retries")
                 break
+            failed_reads = 0
+            self._update_video_size_from_frame(frame)
 
             if self.gaze_correction_enabled:
                 display_frame = self.process_frame(frame)

@@ -1,6 +1,6 @@
 # Architecture & Module Documentation
 
-> Developer reference for the SpecTree system.
+> Developer reference for the spec3 correction system.
 > For user-facing setup and usage, see the [README](../README.md).
 
 ## System Overview

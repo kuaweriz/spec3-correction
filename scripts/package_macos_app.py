@@ -10,12 +10,10 @@ import subprocess
 from pathlib import Path
 
 
-APP_NAME = "SpecTree"
-STOP_APP_NAME = "Stop SpecTree"
-BUNDLE_ID = "local.spectree"
-STOP_BUNDLE_ID = "local.stop-spectree"
-LEGACY_APP_NAMES = ("Gaze Correction Camera",)
-LEGACY_STOP_APP_NAMES = ("Stop Gaze Correction Camera",)
+APP_NAME = "spec3 correction"
+BUNDLE_ID = "local.spec3-correction"
+LEGACY_APP_NAMES = ("Gaze Correction Camera", "SpecTree")
+LEGACY_STOP_APP_NAMES = ("Stop Gaze Correction Camera", "Stop SpecTree", "Stop spec3 correction")
 
 
 def make_icon_png(path: Path, size: int) -> None:
@@ -126,49 +124,11 @@ def write_info_plist(contents_dir: Path) -> None:
         "LSMinimumSystemVersion": "14.0",
         "LSArchitecturePriority": ["arm64"],
         "LSRequiresNativeExecution": True,
-        "NSCameraUsageDescription": "Camera access is needed for SpecTree to correct gaze in real time.",
+        "NSCameraUsageDescription": "Camera access is needed for spec3 correction to correct gaze in real time.",
         "NSDesktopFolderUsageDescription": "Desktop access is only needed when loading this local app bundle.",
     }
     with (contents_dir / "Info.plist").open("wb") as f:
         plistlib.dump(info, f)
-
-
-def write_stop_app_info_plist(contents_dir: Path) -> None:
-    info = {
-        "CFBundleDevelopmentRegion": "en",
-        "CFBundleDisplayName": STOP_APP_NAME,
-        "CFBundleExecutable": STOP_APP_NAME,
-        "CFBundleIconFile": "AppIcon",
-        "CFBundleIdentifier": STOP_BUNDLE_ID,
-        "CFBundleInfoDictionaryVersion": "6.0",
-        "CFBundleName": STOP_APP_NAME,
-        "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "1",
-        "LSMinimumSystemVersion": "14.0",
-        "LSArchitecturePriority": ["arm64"],
-        "LSRequiresNativeExecution": True,
-    }
-    with (contents_dir / "Info.plist").open("wb") as f:
-        plistlib.dump(info, f)
-
-
-def write_stop_launcher(macos_dir: Path, repo_dir: Path) -> None:
-    source = repo_dir / "scripts" / "native_stopper.m"
-    launcher = macos_dir / STOP_APP_NAME
-    subprocess.run(
-        [
-            "clang",
-            "-fobjc-arc",
-            str(source),
-            "-framework",
-            "Cocoa",
-            "-o",
-            str(launcher),
-        ],
-        check=True,
-    )
-    launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def copy_project(repo_dir: Path, resources_dir: Path) -> None:
@@ -195,22 +155,18 @@ def main() -> None:
     repo_dir = Path(__file__).resolve().parents[1]
     desktop_dir = Path.home() / "Desktop"
     app_dir = desktop_dir / f"{APP_NAME}.app"
-    stop_app_dir = desktop_dir / f"{STOP_APP_NAME}.app"
     contents_dir = app_dir / "Contents"
     macos_dir = contents_dir / "MacOS"
     resources_dir = contents_dir / "Resources"
-    stop_contents_dir = stop_app_dir / "Contents"
-    stop_macos_dir = stop_contents_dir / "MacOS"
-    stop_resources_dir = stop_contents_dir / "Resources"
 
     if app_dir.exists():
         shutil.rmtree(app_dir)
-    if stop_app_dir.exists():
-        shutil.rmtree(stop_app_dir)
+
     for legacy_name in LEGACY_APP_NAMES:
         legacy_dir = desktop_dir / f"{legacy_name}.app"
         if legacy_dir.exists():
             shutil.rmtree(legacy_dir)
+
     for legacy_name in LEGACY_STOP_APP_NAMES:
         legacy_dir = desktop_dir / f"{legacy_name}.app"
         if legacy_dir.exists():
@@ -218,19 +174,13 @@ def main() -> None:
 
     macos_dir.mkdir(parents=True)
     resources_dir.mkdir(parents=True)
-    stop_macos_dir.mkdir(parents=True)
-    stop_resources_dir.mkdir(parents=True)
 
     write_launcher(macos_dir, repo_dir)
     write_info_plist(contents_dir)
     copy_project(repo_dir, resources_dir)
     create_icon(resources_dir)
-    write_stop_launcher(stop_macos_dir, repo_dir)
-    write_stop_app_info_plist(stop_contents_dir)
-    create_icon(stop_resources_dir)
 
     print(app_dir)
-    print(stop_app_dir)
 
 
 if __name__ == "__main__":

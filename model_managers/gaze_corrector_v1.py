@@ -251,15 +251,25 @@ class PupilHoldFilter:
             return np.zeros(2, dtype=np.float32)
 
         previous_raw = self.smoothed_offsets[eye_side]
+        raw_step = float(np.linalg.norm(raw - previous_raw))
         raw_smooth_alpha = 0.22 + 0.24 * (1.0 - stabilizer_strength)
         raw_smoothed = previous_raw * (1.0 - raw_smooth_alpha) + raw * raw_smooth_alpha
 
         stable = self.stable_offsets[eye_side]
         distance = float(np.linalg.norm(raw_smoothed - stable))
 
+        # A real gaze change should not be dragged back like reading jitter.
+        if raw_step > 0.11 and distance > 0.54:
+            self.smoothed_offsets[eye_side] = raw_smoothed
+            self.stable_offsets[eye_side] = raw_smoothed
+            self.release_scores[eye_side] = 1.0
+            return np.zeros(2, dtype=np.float32)
+
         release_score = self.release_scores.get(eye_side, 0.0) * 0.86
         release_distance = 0.24 + 0.08 * stabilizer_strength
-        if distance > release_distance:
+        if raw_step > 0.070 and distance > 0.36:
+            release_score += 0.24
+        elif distance > release_distance:
             release_score += min(0.08 + (distance - release_distance) * 0.8, 0.22)
         else:
             release_score -= 0.04
@@ -298,17 +308,36 @@ class EyeOutputHoldFilter:
         self.previous.pop(eye_side, None)
 
     def apply(self, eye_side: str, image: np.ndarray, hold_strength: float) -> np.ndarray:
-        if hold_strength <= 0.02:
-            self.previous[eye_side] = image.astype(np.float32)
-            return image
-
         current = image.astype(np.float32)
         previous = self.previous.get(eye_side)
+
+        if hold_strength <= 0.02:
+            if previous is None or previous.shape != current.shape:
+                self.previous[eye_side] = current
+                return image
+
+            diff = float(np.mean(np.abs(current - previous)))
+            if diff < 0.075:
+                alpha = 0.42
+            elif diff < 0.135:
+                alpha = 0.62
+            else:
+                self.previous[eye_side] = current
+                return image
+
+            smoothed = previous * (1.0 - alpha) + current * alpha
+            self.previous[eye_side] = smoothed
+            return smoothed
+
         if previous is None or previous.shape != current.shape:
             self.previous[eye_side] = current
             return current
 
         diff = float(np.mean(np.abs(current - previous)))
+
+        if diff > 0.34 and hold_strength < 0.74:
+            self.previous[eye_side] = current
+            return image
 
         # High reading hold means the generated eye should barely update frame-to-frame.
         alpha = 0.008 + 0.34 * ((1.0 - hold_strength) ** 2.0)
@@ -331,6 +360,7 @@ class ReadingActivityDetector:
         self.active = False
         self.active_until = 0.0
         self.release_until = 0.0
+        self.last_release = 0.0
 
     def reset(self) -> None:
         self.history.clear()
@@ -338,6 +368,7 @@ class ReadingActivityDetector:
         self.active = False
         self.active_until = 0.0
         self.release_until = 0.0
+        self.last_release = 0.0
 
     def update(
         self,
@@ -361,32 +392,40 @@ class ReadingActivityDetector:
             self.history.popleft()
 
         evidence, release = self._reading_evidence(now)
+        self.last_release = release
         if release > 0:
-            self.release_until = max(self.release_until, now + 0.24)
+            self.release_until = max(self.release_until, now + 0.34)
             self.active_until = 0.0
-            self.score *= 1.0 - 0.72 * release
+            self.score = min(self.score * (1.0 - 0.86 * release), 0.12)
+            if self.history:
+                latest = self.history[-1]
+                self.history.clear()
+                self.history.append(latest)
         if now < self.release_until:
-            evidence *= 0.10
+            evidence *= 0.04
 
-        if evidence > 0.26:
-            self.active_until = max(self.active_until, now + 0.48)
+        if evidence > 0.28:
+            self.active_until = max(self.active_until, now + 0.58)
 
-        rate = 0.56 if evidence >= self.score else (0.16 if self.active else 0.30)
+        if evidence > 0.54:
+            rate = 0.78
+        else:
+            rate = 0.62 if evidence >= self.score else (0.14 if self.active else 0.34)
         self.score = float(np.clip(self.score * (1.0 - rate) + evidence * rate, 0.0, 1.0))
 
         if now < self.release_until:
             self.active = False
         elif self.active:
-            self.active = self.score > 0.17 or now < self.active_until
+            self.active = self.score > 0.15 or now < self.active_until
         else:
-            self.active = self.score > 0.34
+            self.active = self.score > 0.29 or evidence > 0.62
         return self.active, self.score
 
     def _reading_evidence(self, now: float) -> tuple[float, float]:
         if len(self.history) < 5:
             return 0.0, 0.0
 
-        window = [(t, point) for t, point in self.history if now - t <= 0.82]
+        window = [(t, point) for t, point in self.history if now - t <= 0.88]
         if len(window) < 5:
             window = list(self.history)
 
@@ -402,6 +441,8 @@ class ReadingActivityDetector:
         total_horizontal_motion = float(np.sum(abs_dx))
         x_range = float(np.percentile(points[:, 0], 90) - np.percentile(points[:, 0], 10))
         y_range = float(np.percentile(points[:, 1], 90) - np.percentile(points[:, 1], 10))
+        mean_x_abs = float(abs(np.mean(points[:, 0])))
+        end_x_abs = float(abs(points[-1, 0]))
 
         active_horizontal_steps = abs_dx > 0.0022
         small_horizontal_steps = np.logical_and(abs_dx > 0.0022, abs_dx < 0.052)
@@ -446,19 +487,79 @@ class ReadingActivityDetector:
             fresh_changes = int(np.sum(signs[1:] * signs[:-1] < 0))
 
         max_step = float(np.max(abs_dx)) if len(abs_dx) else 0.0
+        median_active_step = (
+            float(np.median(abs_dx[active_horizontal_steps]))
+            if np.any(active_horizontal_steps)
+            else 0.0
+        )
         net_horizontal_motion = float(abs(points[-1, 0] - points[0, 0]))
         path_direct_ratio = net_horizontal_motion / max(total_horizontal_motion, 1e-6)
         recent_max_step = float(np.max(np.abs(recent))) if len(recent) else 0.0
-        long_micro_scan = small_step_count >= 10 and active_span > 0.42 and max_step < 0.035
-        sustained_small_motion = (
-            small_step_count >= 5
-            and active_step_count >= 6
-            and active_ratio > 0.32
-            and active_span > 0.22
-            and total_horizontal_motion > 0.030
-            and horizontal_motion > 0.0030
-            and (direction_texture or long_micro_scan or path_direct_ratio < 0.74)
+        side_fixation = (
+            end_x_abs > 0.165
+            and mean_x_abs > 0.135
+            and x_range < 0.090
+            and total_horizontal_motion < 0.220
+            and max_step < 0.065
         )
+        side_noise = (
+            end_x_abs > 0.205
+            and x_range < 0.075
+            and active_span > 0.20
+            and bidirectional_ratio > 0.20
+        )
+        long_micro_scan = (
+            small_step_count >= 10
+            and active_span > 0.42
+            and max_step < 0.035
+            and path_direct_ratio < 0.64
+            and bidirectional_ratio > 0.08
+        )
+        progressive_reading_scan = (
+            small_step_count >= 7
+            and active_step_count >= 8
+            and active_ratio > 0.30
+            and active_span > 0.36
+            and total_horizontal_motion > 0.040
+            and horizontal_motion > 0.0032
+            and max_step < 0.050
+            and median_active_step < 0.028
+            and y_range < 0.155
+            and vertical_motion < 0.026
+            and (mean_x_abs < 0.135 or x_range > 0.075)
+            and not side_fixation
+        )
+        alternating_motion = (
+            sign_changes >= 2
+            and bidirectional_ratio > 0.16
+            and small_step_count >= 4
+        ) or (
+            recent_changes >= 2
+            and bidirectional_ratio > 0.12
+            and small_step_count >= 3
+        )
+        scan_texture = alternating_motion or long_micro_scan or progressive_reading_scan
+        meaningful_scan_range = x_range > 0.018 and total_horizontal_motion > 0.045
+        sustained_small_motion = (
+            (
+                small_step_count >= 5
+                and active_step_count >= 6
+                and active_ratio > 0.32
+                and active_span > 0.22
+                and total_horizontal_motion > 0.030
+                and horizontal_motion > 0.0030
+                and meaningful_scan_range
+                and scan_texture
+            )
+            or progressive_reading_scan
+        )
+        slow_direct_glance = (
+            total_horizontal_motion > 0.036
+            and path_direct_ratio > 0.82
+            and bidirectional_ratio < 0.10
+            and sign_changes <= 1
+            and active_span < 0.72
+        ) or side_fixation or side_noise
         recent_direct_release = (
             recent_abs > 0.050
             and recent_max_step > 0.026
@@ -470,7 +571,7 @@ class ReadingActivityDetector:
             and fresh_direct_ratio > 0.84
             and fresh_changes == 0
         )
-        directed_glance = recent_direct_release or (
+        directed_glance = recent_direct_release or slow_direct_glance or (
             not sustained_small_motion
             and (
                 (
@@ -490,15 +591,6 @@ class ReadingActivityDetector:
                     and active_step_count <= 5
                 )
             )
-        )
-        alternating_motion = (
-            sign_changes >= 2
-            and bidirectional_ratio > 0.16
-            and small_step_count >= 4
-        ) or (
-            recent_changes >= 2
-            and bidirectional_ratio > 0.12
-            and small_step_count >= 3
         )
 
         step_score = np.clip((small_step_count - 2.0) / 7.0, 0.0, 1.0)
@@ -529,8 +621,16 @@ class ReadingActivityDetector:
         )
         if not sustained_small_motion:
             evidence *= 0.34
+        elif progressive_reading_scan and not alternating_motion:
+            evidence = max(evidence * 0.94, 0.50)
         elif not alternating_motion:
             evidence *= 0.82
+        if scan_texture and meaningful_scan_range and active_span > 0.18 and active_ratio > 0.34:
+            evidence = max(evidence, 0.46 + min(sign_changes, 4) * 0.055)
+        if progressive_reading_scan:
+            evidence = max(evidence, 0.54)
+        if side_fixation or side_noise:
+            evidence = 0.0
         if directed_glance:
             evidence = 0.0
 
@@ -893,15 +993,14 @@ class GazeCorrector:
         reading_stabilizer: float | None = None,
         natural_motion: float | None = None,
         save: bool = True,
+        reset_tracking: bool = True,
     ) -> None:
         """Update manual gaze tuning controls."""
-        should_reset_temporal_state = any(
+        should_reset_temporal_state = reset_tracking and any(
             value is not None
             for value in (
                 enabled,
                 strength,
-                vertical_offset,
-                horizontal_offset,
                 smoothing,
                 reading_stabilizer,
                 natural_motion,
@@ -1023,16 +1122,25 @@ class GazeCorrector:
             re.pupil_offset,
             le_closed or re_closed,
         )
-        if active:
-            intensity = np.clip((score - 0.12) / 0.38, 0.0, 1.0)
+        now = time.monotonic()
+        release_active = now < self.reading_detector.release_until
+
+        if release_active:
+            target_hold = 0.0
+            active = False
+            if self.hold_filter_value > 0.02:
+                self.pupil_hold_filter.reset()
+                self.eye_output_hold_filter.reset()
+            self.hold_filter_value = 0.0
+        elif active:
+            intensity = np.clip((score - 0.08) / 0.30, 0.0, 1.0)
             target_hold = float(self.tuning_settings.reading_stabilizer * intensity)
         else:
             target_hold = 0.0
 
-        now = time.monotonic()
         dt = max(1.0 / 120.0, min(now - self.hold_filter_time, 0.12))
         self.hold_filter_time = now
-        tau = 0.055 if target_hold >= self.hold_filter_value else 0.095
+        tau = 0.032 if target_hold >= self.hold_filter_value else 0.060
         alpha = 1.0 - math.exp(-dt / tau)
         hold = self.hold_filter_value * (1.0 - alpha) + target_hold * alpha
         self.hold_filter_value = float(np.clip(hold, 0.0, 1.0))
@@ -1073,6 +1181,10 @@ class GazeCorrector:
             self.pupil_hold_filter.reset()
             self.eye_output_hold_filter.reset()
             self.reading_detector.history.clear()
+            self.reading_detector.score = 0.0
+            self.reading_detector.active = False
+            self.reading_detector.active_until = 0.0
+            self.reading_detector.release_until = max(self.reading_detector.release_until, now + 0.25)
 
         return now < self.motion_guard_until
 
