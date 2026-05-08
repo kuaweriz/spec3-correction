@@ -34,6 +34,7 @@ from utils.camera_selection import (
     camera_name,
     is_virtual_camera_name,
     list_macos_cameras,
+    load_saved_camera_name,
     save_camera_id,
 )
 from displayers.face_predictor import (
@@ -221,12 +222,19 @@ class SingleWindowGazeCorrector:
         self._pending_camera_label = ""
         self.camera_dropdown_open = False
         self.camera_options: list[CameraInfo] = []
-        self.camera_label = f"Camera {self.camera_id}"
+        saved_camera_label = load_saved_camera_name()
+        self.camera_label = saved_camera_label or f"Camera {self.camera_id}"
+        self._camera_label_overrides: dict[int, str] = {}
+        if saved_camera_label:
+            self._camera_label_overrides[self.camera_id] = saved_camera_label
+        self._camera_status_message = "Camera ready"
+        self._camera_status_until = 0.0
+        self._camera_switching = False
         self._camera_refresh_lock = threading.Lock()
         self._camera_refreshing = False
         self._camera_options_refreshed_at = 0.0
         self._camera_refresh_interval = 8.0
-        self.refresh_camera_options()
+        self.refresh_camera_options(async_refresh=True)
 
         # Store default values for reset
         self.default_camera_offset = self.gaze_corrector.get_camera_offset()
@@ -297,7 +305,10 @@ class SingleWindowGazeCorrector:
         """Update the camera list without blocking the UI thread."""
         with self._camera_refresh_lock:
             if cameras:
-                self.camera_options = list(cameras)
+                self.camera_options = [
+                    CameraInfo(camera.id, self._camera_label_overrides.get(camera.id, camera.name))
+                    for camera in cameras
+                ]
             elif not self.camera_options:
                 self.camera_options = [CameraInfo(self.camera_id, f"Camera {self.camera_id}")]
 
@@ -305,7 +316,10 @@ class SingleWindowGazeCorrector:
             if all(camera.id != active_id for camera in self.camera_options):
                 self.camera_options.append(CameraInfo(active_id, f"Camera {active_id}"))
 
-            self.camera_label = camera_name(active_id, self.camera_options)
+            self.camera_label = self._camera_label_overrides.get(
+                active_id,
+                camera_name(active_id, self.camera_options),
+            )
             self._camera_options_refreshed_at = time.monotonic()
             if refresh_finished:
                 self._camera_refreshing = False
@@ -347,13 +361,51 @@ class SingleWindowGazeCorrector:
         """Queue a camera switch from the UI; applied in the main loop."""
         self.camera_dropdown_open = False
         self.camera_label = label
+        self._set_camera_status(f"Switching to {self._short_label(label, 28)}...", 2.5)
         if camera_id != self.camera_id:
             self._pending_camera_id = camera_id
             self._pending_camera_label = label
+            self._camera_switching = True
+        else:
+            save_camera_id(self.camera_id, label)
+            self._camera_label_overrides[self.camera_id] = label
+            self._set_camera_status("Already selected", 1.4)
 
     def _short_camera_label(self, max_chars: int = 25) -> str:
         label = self.camera_label.replace("\xa0", " ")
+        return self._short_label(label, max_chars)
+
+    def _short_label(self, label: str, max_chars: int) -> str:
         return label if len(label) <= max_chars else label[: max_chars - 3].rstrip() + "..."
+
+    def _set_camera_status(self, message: str, ttl: float = 2.0) -> None:
+        self._camera_status_message = message
+        self._camera_status_until = time.monotonic() + ttl
+
+    def _camera_status_text(self) -> str:
+        if self._camera_switching:
+            return "Opening camera..."
+        if self._camera_refreshing:
+            return "Scanning cameras..."
+        if time.monotonic() < self._camera_status_until:
+            return self._camera_status_message
+        return f"Selected slot #{self.camera_id}"
+
+    def _remember_camera_label(self, camera_id: int, label: str) -> None:
+        clean_label = label.strip() or f"Camera {camera_id}"
+        self._camera_label_overrides[camera_id] = clean_label
+        with self._camera_refresh_lock:
+            replaced = False
+            updated_options: list[CameraInfo] = []
+            for camera in self.camera_options:
+                if camera.id == camera_id:
+                    updated_options.append(CameraInfo(camera.id, clean_label))
+                    replaced = True
+                else:
+                    updated_options.append(camera)
+            if not replaced:
+                updated_options.append(CameraInfo(camera_id, clean_label))
+            self.camera_options = updated_options
 
     def _fit_text(self, text: str, max_width: int, size: int, bold: bool = False) -> str:
         if self._measure_text(text, size, bold)[0] <= max_width:
@@ -515,19 +567,21 @@ class SingleWindowGazeCorrector:
         on_label = "ON" if tuning.enabled and self.gaze_correction_enabled else "OFF"
         self._draw_button(canvas, "toggle", (x0 + 292, 24, x0 + 392, 62), on_label, tuning.enabled and self.gaze_correction_enabled)
 
-        camera_y1, camera_y2 = 106, 150
+        camera_y1, camera_y2 = 106, 164
         cv2.rectangle(canvas, (x0 + 28, camera_y1), (x0 + 392, camera_y2), card_bg, -1)
         cv2.rectangle(canvas, (x0 + 28, camera_y1), (x0 + 392, camera_y2), (58, 62, 74), 1)
         cv2.rectangle(canvas, (x0 + 28, camera_y1), (x0 + 33, camera_y2), (74, 82, 96), -1)
-        self._draw_text(canvas, "Camera", (x0 + 46, camera_y1 + 28), 16, muted, bold=True)
-        camera_text = self._fit_text(self._short_camera_label(40), 218, 16)
-        self._draw_text(canvas, camera_text, (x0 + 118, camera_y1 + 28), 16, text)
-        self._draw_text(canvas, "v", (x0 + 369, camera_y1 + 27), 15, muted, bold=True)
+        self._draw_text(canvas, "Camera", (x0 + 46, camera_y1 + 24), 15, muted, bold=True)
+        camera_text = self._fit_text(self._short_camera_label(34), 222, 16)
+        self._draw_text(canvas, camera_text, (x0 + 118, camera_y1 + 24), 16, text, bold=True)
+        self._draw_text(canvas, self._camera_status_text(), (x0 + 118, camera_y1 + 47), 12, (150, 158, 170))
+        chevron = "^" if self.camera_dropdown_open else "v"
+        self._draw_text(canvas, chevron, (x0 + 369, camera_y1 + 25), 15, muted, bold=True)
         self._button_regions["camera_toggle"] = (x0 + 28, camera_y1, x0 + 392, camera_y2)
 
         mode_label = "READ" if reading_active else "LIVE"
         mode_color = accent if reading_active else live_accent
-        mode_y1, mode_y2 = 164, 224
+        mode_y1, mode_y2 = 178, 238
         cv2.rectangle(canvas, (x0 + 28, mode_y1), (x0 + 392, mode_y2), card_bg, -1)
         cv2.rectangle(canvas, (x0 + 28, mode_y1), (x0 + 392, mode_y2), card_line, 1)
         cv2.rectangle(canvas, (x0 + 28, mode_y1), (x0 + 33, mode_y2), mode_color, -1)
@@ -547,12 +601,12 @@ class SingleWindowGazeCorrector:
 
         track_x1 = x0 + 34
         track_x2 = x0 + 286
-        y = 258
+        y = 272
         for key, label, value, min_value, max_value, suffix in sliders:
             self._draw_slider(canvas, key, label, value, min_value, max_value, suffix, y, track_x1, track_x2)
             y += 56
 
-        button_y = min(height - 94, 612)
+        button_y = min(height - 94, 626)
         self._draw_button(canvas, "reading", (x0 + 28, button_y, x0 + 186, button_y + 42), "Reading Preset", reading_active)
         self._draw_button(canvas, "reset", (x0 + 202, button_y, x0 + 292, button_y + 42), "Reset", False)
         self._draw_button(canvas, "quit", (x0 + 308, button_y, x0 + 392, button_y + 42), "Hide", False, danger=True)
@@ -1170,8 +1224,52 @@ class SingleWindowGazeCorrector:
 
         return display_frame
 
-    def _open_camera_capture(self, camera_id: Optional[int] = None):
-        """Open the camera with the most reliable backend for macOS."""
+    def _frame_live_metrics(self, frame: np.ndarray) -> tuple[bool, float, float, float, float]:
+        """Return a conservative live-camera quality estimate for fallback selection."""
+        if frame.ndim == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+
+        sample = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
+        mean = float(sample.mean())
+        std = float(sample.std())
+        bright_ratio = float(np.mean(sample > 28))
+        score = mean * 0.55 + std * 1.35 + bright_ratio * 42.0
+        usable = (
+            (mean >= 12.0 and std >= 7.0)
+            or (std >= 26.0 and bright_ratio >= 0.06)
+            or bright_ratio >= 0.18
+        )
+        return usable, score, mean, std, bright_ratio
+
+    def _camera_candidate_ids(self, preferred_id: int, requested_label: str) -> list[int]:
+        candidates: list[int] = []
+
+        def add(candidate_id: int) -> None:
+            if candidate_id >= 0 and candidate_id not in candidates:
+                candidates.append(candidate_id)
+
+        add(preferred_id)
+        with self._camera_refresh_lock:
+            camera_options = list(self.camera_options)
+
+        physical_first = sorted(
+            camera_options,
+            key=lambda camera: (is_virtual_camera_name(camera.name), camera.id),
+        )
+        for camera in physical_first:
+            add(camera.id)
+
+        # OpenCV can expose AVFoundation devices in a different order from the
+        # native device list, so keep a small slot probe as the final fallback.
+        for camera_id in range(6):
+            add(camera_id)
+
+        return candidates
+
+    def _open_camera_capture_direct(self, camera_id: int, require_live_frame: bool = True):
+        """Open one concrete OpenCV camera slot and verify it returns a live frame."""
         camera_id = self.camera_id if camera_id is None else camera_id
         backends: list[tuple[str, int | None]] = []
         if hasattr(cv2, "CAP_AVFOUNDATION"):
@@ -1195,21 +1293,64 @@ class SingleWindowGazeCorrector:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             has_frame = False
-            for _ in range(18):
+            best_metrics: tuple[bool, float, float, float, float] | None = None
+            for _ in range(10):
                 ret, test_frame = cap.read()
                 if ret and test_frame is not None:
                     has_frame = True
-                    break
-                time.sleep(0.04)
+                    metrics = self._frame_live_metrics(test_frame)
+                    if best_metrics is None or metrics[1] > best_metrics[1]:
+                        best_metrics = metrics
+                time.sleep(0.025)
             if not has_frame:
                 cap.release()
                 self.logger.log(f"Camera {camera_id} opened with {backend_name} but returned no frames")
                 continue
 
+            if best_metrics is not None:
+                usable, score, mean, std, bright_ratio = best_metrics
+                if require_live_frame and not usable:
+                    cap.release()
+                    self.logger.log(
+                        "Camera "
+                        f"{camera_id} returned a blank/inactive image "
+                        f"(score={score:.1f}, mean={mean:.1f}, std={std:.1f}, bright={bright_ratio:.2f})"
+                    )
+                    continue
+
             self.logger.log(f"Camera {camera_id} opened with {backend_name}")
             return cap
 
         return None
+
+    def _open_camera_capture(
+        self,
+        camera_id: Optional[int] = None,
+        requested_label: str = "",
+    ):
+        """Open the requested camera, remapping to a live slot if macOS names are out of order."""
+        preferred_id = self.camera_id if camera_id is None else camera_id
+        label = requested_label or self._camera_label_overrides.get(preferred_id, "")
+        allow_fallback = not label or not is_virtual_camera_name(label)
+        candidates = self._camera_candidate_ids(preferred_id, label) if allow_fallback else [preferred_id]
+
+        for candidate_id in candidates:
+            cap = self._open_camera_capture_direct(candidate_id, require_live_frame=True)
+            if cap is not None:
+                if candidate_id != preferred_id:
+                    pretty_label = self._short_label(label or f"Camera {preferred_id}", 28)
+                    self._set_camera_status(f"{pretty_label} opened on slot #{candidate_id}", 3.0)
+                    self.logger.log(
+                        f"Camera slot remapped: requested {preferred_id}, opened {candidate_id}"
+                    )
+                return cap, candidate_id
+
+        cap = self._open_camera_capture_direct(preferred_id, require_live_frame=False)
+        if cap is not None:
+            self._set_camera_status("Camera opened, but image looks dark", 3.0)
+            return cap, preferred_id
+
+        return None, preferred_id
 
     def _update_video_size_from_frame(self, frame: np.ndarray) -> None:
         frame_h, frame_w = frame.shape[:2]
@@ -1231,21 +1372,30 @@ class SingleWindowGazeCorrector:
         self._pending_camera_id = None
         self._pending_camera_label = ""
         if next_camera_id == self.camera_id:
+            self._camera_switching = False
             return cap
 
         self.logger.log(f"Switching camera {self.camera_id} -> {next_camera_id}")
-        next_cap = self._open_camera_capture(next_camera_id)
+        next_cap, actual_camera_id = self._open_camera_capture(next_camera_id, requested_label)
         if next_cap is None:
             self.logger.log(f"Could not switch to camera {next_camera_id}")
-            self.camera_label = camera_name(self.camera_id, self.camera_options)
+            self.camera_label = self._camera_label_overrides.get(
+                self.camera_id,
+                camera_name(self.camera_id, self.camera_options),
+            )
+            self._camera_switching = False
+            self._set_camera_status("Camera did not respond", 3.0)
             self.refresh_camera_options(force=True, async_refresh=True)
             return cap
 
         cap.release()
-        self.camera_id = next_camera_id
+        self.camera_id = actual_camera_id
         self.camera_label = requested_label or camera_name(self.camera_id, self.camera_options)
+        self._remember_camera_label(self.camera_id, self.camera_label)
         if not is_virtual_camera_name(self.camera_label):
             save_camera_id(self.camera_id, self.camera_label)
+        self._camera_switching = False
+        self._set_camera_status(f"Selected slot #{self.camera_id}", 2.0)
         self.refresh_camera_options(force=False, async_refresh=True)
         self.gaze_corrector.reset_tracking()
         return next_cap
@@ -1253,10 +1403,15 @@ class SingleWindowGazeCorrector:
     def run(self):
         """Main application loop."""
         self.logger.log(f"Starting camera {self.camera_id}...")
-        cap = self._open_camera_capture()
+        cap, actual_camera_id = self._open_camera_capture(self.camera_id, self.camera_label)
         if cap is None:
             self.logger.log(f"Could not open camera {self.camera_id}")
             return
+        if actual_camera_id != self.camera_id:
+            self.camera_id = actual_camera_id
+            self._remember_camera_label(self.camera_id, self.camera_label)
+            if not is_virtual_camera_name(self.camera_label):
+                save_camera_id(self.camera_id, self.camera_label)
 
         self.create_settings_panel()
         self.logger.log("Press 'g' to toggle gaze, 'c' for calibration, 'q' to hide")
