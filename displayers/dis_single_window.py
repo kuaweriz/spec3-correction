@@ -383,17 +383,15 @@ class SingleWindowGazeCorrector:
     ) -> None:
         """Update the camera list without blocking the UI thread."""
         with self._camera_refresh_lock:
+            active_id = self._pending_camera_id if self._pending_camera_id is not None else self.camera_id
             if cameras:
-                self.camera_options = [
-                    CameraInfo(camera.id, self._camera_label_overrides.get(camera.id, camera.name))
-                    for camera in cameras
-                ]
+                self.camera_options = self._camera_options_for_display(cameras, active_id)
             elif not self.camera_options:
                 self.camera_options = [CameraInfo(self.camera_id, f"Camera {self.camera_id}")]
 
-            active_id = self._pending_camera_id if self._pending_camera_id is not None else self.camera_id
             if all(camera.id != active_id for camera in self.camera_options):
                 self.camera_options.append(CameraInfo(active_id, f"Camera {active_id}"))
+                self.camera_options = self._deduplicate_camera_options(self.camera_options, active_id)
 
             self.camera_label = self._camera_label_overrides.get(
                 active_id,
@@ -414,6 +412,48 @@ class SingleWindowGazeCorrector:
             self._apply_camera_options(cameras, refresh_finished=True)
 
         threading.Thread(target=worker, name="spec3-camera-refresh", daemon=True).start()
+
+    @staticmethod
+    def _camera_label_key(label: str) -> str:
+        return label.replace("\xa0", " ").strip().casefold()
+
+    def _camera_options_for_display(
+        self,
+        cameras: list[CameraInfo],
+        active_id: int,
+    ) -> list[CameraInfo]:
+        options = [
+            CameraInfo(camera.id, self._camera_label_overrides.get(camera.id, camera.name))
+            for camera in cameras
+        ]
+        return self._deduplicate_camera_options(options, active_id)
+
+    def _deduplicate_camera_options(
+        self,
+        options: list[CameraInfo],
+        active_id: int,
+    ) -> list[CameraInfo]:
+        """Hide stale native slots after OpenCV remaps a physical camera."""
+        active_label = self._camera_label_overrides.get(active_id)
+        if not active_label:
+            return options
+
+        active_key = self._camera_label_key(active_label)
+        cleaned: list[CameraInfo] = []
+        skipped_duplicate = False
+        for camera in options:
+            is_duplicate = (
+                camera.id != active_id
+                and self._camera_label_key(camera.name) == active_key
+            )
+            if is_duplicate:
+                skipped_duplicate = True
+                continue
+            cleaned.append(camera)
+
+        if skipped_duplicate and all(camera.id != active_id for camera in cleaned):
+            cleaned.insert(0, CameraInfo(active_id, active_label))
+        return cleaned
 
     def refresh_camera_options(self, force: bool = False, async_refresh: bool = False) -> None:
         """Refresh camera names shown in the in-app selector."""
@@ -485,7 +525,7 @@ class SingleWindowGazeCorrector:
                     updated_options.append(camera)
             if not replaced:
                 updated_options.append(CameraInfo(camera_id, clean_label))
-            self.camera_options = updated_options
+            self.camera_options = self._deduplicate_camera_options(updated_options, camera_id)
 
     def _fit_text(self, text: str, max_width: int, size: int, bold: bool = False) -> str:
         if self._measure_text(text, size, bold)[0] <= max_width:
