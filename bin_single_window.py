@@ -40,14 +40,25 @@ def detect_camera_resolution(camera_id: int) -> tuple[int, int]:
         cap = cv2.VideoCapture(camera_id)
     if not cap.isOpened():
         print(f"Warning: Could not open camera {camera_id}, using default resolution")
-        return (640, 480)
+        return (1280, 720)
 
-    ret, frame = cap.read()
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    ret = False
+    frame = None
+    for _ in range(12):
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            break
     if ret and frame is not None:
         height, width = frame.shape[:2]
     else:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width <= 0 or height <= 0:
+            width, height = 1280, 720
     cap.release()
     
     print(f"Detected camera resolution: {width}x{height}")
