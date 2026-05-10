@@ -1018,7 +1018,7 @@ class GazeCorrector:
     def __init__(
         self,
         config_path: str = "./model_managers/gaze_corrector_v1_01.yaml",
-        db_path: str = "./user_settings.db",
+        db_path: str | None = None,
         setting_name: str = "camera_default",
     ):
         """

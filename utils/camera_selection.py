@@ -70,6 +70,10 @@ def _normalise_camera_name(name: str) -> str:
     return name.replace("\xa0", " ").strip()
 
 
+def _camera_names_match(left: str, right: str) -> bool:
+    return _normalise_camera_name(left).casefold() == _normalise_camera_name(right).casefold()
+
+
 def _list_cameras_from_json_profiler() -> list[CameraInfo]:
     try:
         result = subprocess.run(
@@ -198,24 +202,31 @@ def choose_camera_id(requested_camera_id: int) -> int:
     cameras = list_macos_cameras()
     saved_camera_id = load_saved_camera_id()
     saved_camera_name = load_saved_camera_name()
-    if (
-        saved_camera_id is not None
-        and saved_camera_name
-        and not is_virtual_camera_name(saved_camera_name)
-    ):
-        print(f"Using saved camera slot {saved_camera_id}: {saved_camera_name}")
-        return saved_camera_id
-
     saved_camera = next((camera for camera in cameras if camera.id == saved_camera_id), None)
+
+    if saved_camera_name and not is_virtual_camera_name(saved_camera_name):
+        if saved_camera is not None and _camera_names_match(saved_camera.name, saved_camera_name):
+            print(f"Using saved camera slot {saved_camera.id}: {saved_camera.name}")
+            return saved_camera.id
+
+        saved_by_name = next(
+            (camera for camera in cameras if _camera_names_match(camera.name, saved_camera_name)),
+            None,
+        )
+        if saved_by_name is not None and not is_virtual_camera_name(saved_by_name.name):
+            print(f"Using saved camera by name {saved_by_name.id}: {saved_by_name.name}")
+            return saved_by_name.id
+
+        if saved_camera is not None and not is_virtual_camera_name(saved_camera.name):
+            print(
+                "Saved camera name was not found in the current list; "
+                f"falling back to slot {saved_camera.id}: {saved_camera.name}"
+            )
+            return saved_camera.id
+
     if saved_camera is not None and not is_virtual_camera_name(saved_camera.name):
         print(f"Using saved camera {saved_camera.id}: {saved_camera.name}")
         return saved_camera_id
-
-    if saved_camera_name and not is_virtual_camera_name(saved_camera_name):
-        saved_by_name = next((camera for camera in cameras if camera.name == saved_camera_name), None)
-        if saved_by_name is not None:
-            print(f"Using saved camera {saved_by_name.id}: {saved_by_name.name}")
-            return saved_by_name.id
 
     if not cameras:
         print("Could not list macOS cameras; using camera 0")

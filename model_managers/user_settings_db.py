@@ -5,6 +5,7 @@ Provides SQLite database functionality for storing and retrieving user settings.
 """
 
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -13,16 +14,29 @@ from typing import Optional
 
 class UserSettingsDB:
     """Manages user settings in SQLite database."""
-    
-    def __init__(self, db_path: str = "./user_settings.db"):
+
+    def __init__(self, db_path: Optional[str] = None):
         """
         Initialize database connection.
-        
+
         Args:
             db_path: Path to SQLite database file
         """
-        self.db_path = Path(db_path)
+        self.db_path = Path(db_path) if db_path else self._default_db_path()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_database()
+
+    @staticmethod
+    def _default_db_path() -> Path:
+        env_path = os.environ.get("SPEC3_SETTINGS_DB_FILE")
+        if env_path:
+            return Path(env_path)
+
+        support_dir = os.environ.get("SPEC3_SUPPORT_DIR")
+        if support_dir:
+            return Path(support_dir) / "user_settings.db"
+
+        return Path.home() / "Library" / "Application Support" / "spec3 correction" / "user_settings.db"
     
     def _init_database(self):
         """Create database table if it doesn't exist."""

@@ -62,6 +62,7 @@
 @property(nonatomic, copy) NSString *cameraListPath;
 @property(nonatomic, copy) NSString *trainingStatePath;
 @property(nonatomic, copy) NSString *preferencesPath;
+@property(nonatomic, copy) NSString *settingsDbPath;
 @property(nonatomic, strong) NSTimer *nativeRequestTimer;
 @property(nonatomic) NSTimeInterval lastNativeRequestMTime;
 @property(nonatomic) BOOL isQuitting;
@@ -128,6 +129,7 @@
     self.cameraListPath = [supportDir stringByAppendingPathComponent:@"cameras.json"];
     self.trainingStatePath = [supportDir stringByAppendingPathComponent:@"training_state.json"];
     self.preferencesPath = [supportDir stringByAppendingPathComponent:@"preferences.json"];
+    self.settingsDbPath = [supportDir stringByAppendingPathComponent:@"user_settings.db"];
 
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:logDir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -388,7 +390,15 @@
 }
 
 - (void)writeCameraList {
-    NSArray<AVCaptureDevice *> *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+    NSArray<AVCaptureDeviceType> *deviceTypes = @[
+        AVCaptureDeviceTypeBuiltInWideAngleCamera,
+        AVCaptureDeviceTypeExternal,
+    ];
+    AVCaptureDeviceDiscoverySession *session = [AVCaptureDeviceDiscoverySession
+        discoverySessionWithDeviceTypes:deviceTypes
+                              mediaType:AVMediaTypeVideo
+                               position:AVCaptureDevicePositionUnspecified];
+    NSArray<AVCaptureDevice *> *devices = session.devices;
     NSMutableArray *items = [NSMutableArray arrayWithCapacity:devices.count];
     NSInteger index = 0;
     for (AVCaptureDevice *device in devices) {
@@ -445,6 +455,7 @@
     env[@"SPEC3_LOG_FILE"] = self.logPath;
     env[@"SPEC3_TRAINING_STATE_FILE"] = self.trainingStatePath;
     env[@"SPEC3_PREFERENCES_FILE"] = self.preferencesPath;
+    env[@"SPEC3_SETTINGS_DB_FILE"] = self.settingsDbPath;
     [newTask setEnvironment:env];
     [newTask setStandardOutput:self.logHandle];
     [newTask setStandardError:self.logHandle];

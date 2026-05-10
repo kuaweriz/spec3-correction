@@ -12,6 +12,7 @@ from pathlib import Path
 
 APP_NAME = "spec3 correction"
 BUNDLE_ID = "local.spec3-correction"
+APP_VERSION = "1.2.0"
 LEGACY_APP_NAMES = ("Gaze Correction Camera", "SpecTree")
 LEGACY_STOP_APP_NAMES = ("Stop Gaze Correction Camera", "Stop SpecTree", "Stop spec3 correction")
 
@@ -125,8 +126,8 @@ def write_info_plist(contents_dir: Path) -> None:
                 "CFBundleURLSchemes": ["spec3correction"],
             }
         ],
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "1",
+        "CFBundleShortVersionString": APP_VERSION,
+        "CFBundleVersion": "12",
         "LSMinimumSystemVersion": "14.0",
         "LSArchitecturePriority": ["arm64"],
         "LSRequiresNativeExecution": True,
@@ -151,8 +152,13 @@ def copy_project(repo_dir: Path, resources_dir: Path) -> None:
             "__pycache__",
             "build",
             "dist",
+            "user_settings.db",
         }
-        return {name for name in names if name in ignored or name.endswith(".app")}
+        return {
+            name
+            for name in names
+            if name in ignored or name.endswith(".app") or name.endswith(".log")
+        }
 
     shutil.copytree(repo_dir, project_dir, symlinks=True, ignore=ignore)
 

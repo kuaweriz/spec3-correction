@@ -1781,7 +1781,7 @@ class SingleWindowGazeCorrector:
         next_cap, actual_camera_id = self._open_camera_capture(
             next_camera_id,
             requested_label,
-            allow_remap=False,
+            allow_remap=True,
         )
         if next_cap is None:
             self.logger.log(f"Could not switch to camera {next_camera_id}")
