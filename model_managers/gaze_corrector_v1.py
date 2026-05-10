@@ -160,6 +160,14 @@ class OneEuroVectorFilter:
         self.prev_time = None
         self.started_at = time.monotonic()
 
+    def snap(self, value: list[float], natural_scale: float = 1.0) -> list[float]:
+        """Jump the filter to a user-controlled gaze target without easing lag."""
+        value_np = np.asarray(value, dtype=np.float32)
+        self.prev_value = value_np.copy()
+        self.prev_derivative = np.zeros_like(value_np)
+        self.prev_time = time.monotonic()
+        return self._add_natural_motion(value_np, natural_scale).tolist()
+
     def apply(self, value: list[float], natural_scale: float = 1.0) -> list[float]:
         """Return a smoothed gaze angle vector [vertical, horizontal]."""
         now = time.monotonic()
@@ -1070,6 +1078,7 @@ class GazeCorrector:
         self.motion_guard_strength = 0.0
         self.eye_closed_previous = {"L": False, "R": False}
         self.eye_reopen_time = {"L": 0.0, "R": 0.0}
+        self.manual_aim_until = 0.0
 
     def _load_camera_settings(self) -> CameraUserSetting:
         """Load camera settings from database or return defaults."""
@@ -1224,6 +1233,22 @@ class GazeCorrector:
         self.stabilization_cfg.enabled = enabled
         if not enabled:
             self.gaze_filter.reset()
+
+    def hold_manual_aim(self, duration: float = 0.22) -> None:
+        """Temporarily prioritize live mouse/slider gaze control over reading locks."""
+        self.manual_aim_until = max(
+            self.manual_aim_until,
+            time.monotonic() + max(0.0, duration),
+        )
+        if self.hold_filter_value > 0.02:
+            self.pupil_hold_filter.reset()
+            self.eye_output_hold_filter.reset()
+        self.hold_filter_value = 0.0
+        self.last_reading_active = False
+        self.last_effective_hold = 0.0
+
+    def _manual_aim_active(self) -> bool:
+        return time.monotonic() < self.manual_aim_until
 
     def get_tuning(self) -> GazeTuningSetting:
         """Get current manual gaze tuning settings."""
@@ -1382,6 +1407,8 @@ class GazeCorrector:
         ]
 
         if self.stabilization_cfg.enabled:
+            if self._manual_aim_active():
+                return self.gaze_filter.snap(tuned_alpha, natural_scale), eye_position
             return self.gaze_filter.apply(tuned_alpha, natural_scale), eye_position
 
         return tuned_alpha, eye_position
@@ -1916,7 +1943,7 @@ class GazeCorrector:
         if binary.max() == 0:
             return np.zeros(aperture.shape, dtype=np.float32)
 
-        erode_px = max(1, int(min(h, w) * (0.018 + 0.030 * intensity)))
+        erode_px = max(1, int(min(h, w) * (0.020 + 0.040 * intensity)))
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1)
         )
@@ -1925,7 +1952,7 @@ class GazeCorrector:
             inner = binary
 
         distance = cv2.distanceTransform(inner, cv2.DIST_L2, 3)
-        feather = max(1.0, min(h, w) * (0.035 + 0.020 * intensity))
+        feather = max(1.0, min(h, w) * (0.030 + 0.018 * intensity))
         visible = np.clip(distance / feather, 0.0, 1.0)
         visible = np.minimum(visible, aperture)
         blur = max(3, int(min(h, w) * 0.030) | 1)
@@ -1999,10 +2026,10 @@ class GazeCorrector:
 
         target_x = w * (0.50 + np.clip(horizontal_angle / 42.0, -1.0, 1.0) * 0.14)
         target_x = float(np.clip(target_x, w * 0.30 + iris_w * 0.18, w * 0.70 - iris_w * 0.18))
-        target_y = aperture_top + aperture_h * (0.56 + 0.24 * intensity)
-        target_y = float(np.clip(target_y, aperture_top + iris_h * 0.20, aperture_bottom - iris_h * 0.08))
-        shift_x = float(np.clip(target_x - cx, -w * 0.20, w * 0.20))
-        shift_y = float(np.clip(target_y - cy, -h * 0.03, h * (0.18 + 0.10 * intensity)))
+        target_y = aperture_top + aperture_h * (0.56 + 0.18 * intensity)
+        target_y = float(np.clip(target_y, aperture_top + iris_h * 0.22, aperture_bottom - iris_h * 0.18))
+        shift_x = float(np.clip(target_x - cx, -w * 0.18, w * 0.18))
+        shift_y = float(np.clip(target_y - cy, -h * 0.03, h * (0.13 + 0.07 * intensity)))
 
         matrix = np.asarray([[1.0, 0.0, shift_x], [0.0, 1.0, shift_y]], dtype=np.float32)
         shifted_eye = cv2.warpAffine(
@@ -2029,10 +2056,10 @@ class GazeCorrector:
             cv2.MORPH_ELLIPSE,
             (
                 max(3, int(w * (0.080 + 0.035 * intensity)) | 1),
-                max(3, int(h * (0.140 + 0.050 * intensity)) | 1),
+                max(3, int(h * (0.155 + 0.075 * intensity)) | 1),
             ),
         )
-        cleanup = cv2.dilate(cleanup, cleanup_kernel, iterations=2)
+        cleanup = cv2.dilate(cleanup, cleanup_kernel, iterations=3)
         cleanup = np.clip(cleanup.astype(np.float32) * aperture, 0.0, 1.0)
 
         inpaint_mask = (cleanup > 0.08).astype(np.uint8) * 255
@@ -2046,7 +2073,7 @@ class GazeCorrector:
         cleanup_soft = np.clip(cv2.GaussianBlur(cleanup, (5, 5), 0), 0.0, 1.0)
         retargeted = shifted_eye * shifted_mask[:, :, None] + cleaned * (1.0 - shifted_mask[:, :, None])
 
-        alpha_boost = np.maximum(cleanup_soft * 0.96, shifted_mask * 0.99) * intensity
+        alpha_boost = np.maximum(cleanup_soft * 0.98, shifted_mask * 0.99) * intensity
         output = retargeted * intensity + original * (1.0 - intensity)
         return np.clip(output, 0.0, 1.0), np.clip(alpha_boost, 0.0, 0.98), intensity
 
@@ -2276,7 +2303,8 @@ class GazeCorrector:
 
         motion_guard = self._face_motion_guard_active(le, re)
         hold_strength = self._adaptive_reading_hold(le, re, le_closed, re_closed)
-        if motion_guard:
+        manual_aim_active = self._manual_aim_active()
+        if motion_guard or manual_aim_active:
             hold_strength = 0.0
             self.last_reading_active = False
             self.last_effective_hold = 0.0

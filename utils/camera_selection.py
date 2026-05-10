@@ -209,6 +209,15 @@ def choose_camera_id(requested_camera_id: int) -> int:
             print(f"Using saved camera slot {saved_camera.id}: {saved_camera.name}")
             return saved_camera.id
 
+        if saved_camera_id is not None and (
+            saved_camera is None or is_virtual_camera_name(saved_camera.name)
+        ):
+            print(
+                "Using previously verified live camera slot "
+                f"{saved_camera_id}: {saved_camera_name}"
+            )
+            return saved_camera_id
+
         saved_by_name = next(
             (camera for camera in cameras if _camera_names_match(camera.name, saved_camera_name)),
             None,

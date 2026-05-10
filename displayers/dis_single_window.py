@@ -992,6 +992,9 @@ class SingleWindowGazeCorrector:
 
         if save:
             self._aim_save_when_settled = True
+            self._update_preview_aim_motion(force=True, save=True)
+        elif self._dragging_preview_aim:
+            self._update_preview_aim_motion(force=False, save=False)
 
     def _update_preview_aim_motion(self, force: bool = False, save: bool = False) -> None:
         if self._aim_target_offsets is None:
@@ -1010,14 +1013,15 @@ class SingleWindowGazeCorrector:
         if force:
             next_offsets = target
         else:
-            response = 0.070 if self._dragging_preview_aim else 0.095
+            response = 0.018 if self._dragging_preview_aim else 0.055
             alpha = 1.0 - math.exp(-dt / response)
             raw_next = (
                 current[0] * (1.0 - alpha) + target[0] * alpha,
                 current[1] * (1.0 - alpha) + target[1] * alpha,
             )
-            max_vertical_step = 2.8 * max(0.5, min(dt * 60.0, 1.7))
-            max_horizontal_step = 1.8 * max(0.5, min(dt * 60.0, 1.7))
+            speed_scale = max(0.5, min(dt * 60.0, 1.7))
+            max_vertical_step = (9.5 if self._dragging_preview_aim else 4.4) * speed_scale
+            max_horizontal_step = (6.8 if self._dragging_preview_aim else 3.2) * speed_scale
             next_offsets = (
                 current[0] + max(-max_vertical_step, min(raw_next[0] - current[0], max_vertical_step)),
                 current[1] + max(-max_horizontal_step, min(raw_next[1] - current[1], max_horizontal_step)),
@@ -1031,6 +1035,8 @@ class SingleWindowGazeCorrector:
             return
 
         self._aim_applied_offsets = next_offsets
+        if self._dragging_preview_aim or save:
+            self.gaze_corrector.hold_manual_aim(0.24)
         self.gaze_corrector.set_tuning(
             vertical_offset=next_offsets[0],
             horizontal_offset=next_offsets[1],
@@ -1043,7 +1049,9 @@ class SingleWindowGazeCorrector:
             and abs(next_offsets[0] - target[0]) < 0.08
             and abs(next_offsets[1] - target[1]) < 0.08
         ):
-            if self._aim_save_when_settled:
+            if save:
+                self._aim_save_when_settled = False
+            elif self._aim_save_when_settled:
                 self.gaze_corrector.save_tuning_settings()
                 self._aim_save_when_settled = False
             self._aim_target_offsets = None
@@ -1354,6 +1362,9 @@ class SingleWindowGazeCorrector:
             kwargs["reading_stabilizer"] = value / 100.0
         elif key == "live":
             kwargs["natural_motion"] = value / 100.0
+
+        if key in ("vertical", "horizontal"):
+            self.gaze_corrector.hold_manual_aim(0.24)
 
         self.gaze_corrector.set_tuning(**kwargs)
 
