@@ -11,6 +11,7 @@ A simplified gaze correction application that:
 
 from __future__ import annotations
 
+import json
 import os
 import math
 import subprocess
@@ -51,24 +52,39 @@ from model_managers.gaze_corrector_v1 import GazeCorrector
 ################################################################################
 
 
-UI_FONT_REGULAR = "/System/Library/Fonts/SFNS.ttf"
-UI_FONT_BOLD = "/System/Library/Fonts/SFNS.ttf"
+UI_FONT_FAMILIES = {
+    "rounded": ("/System/Library/Fonts/SFNSRounded.ttf", "/System/Library/Fonts/SFNSRounded.ttf"),
+    "system": ("/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/SFNS.ttf"),
+    "compact": ("/System/Library/Fonts/SFCompact.ttf", "/System/Library/Fonts/SFCompact.ttf"),
+    "mono": ("/System/Library/Fonts/SFNSMono.ttf", "/System/Library/Fonts/SFNSMono.ttf"),
+    "serif": ("/System/Library/Fonts/NewYork.ttf", "/System/Library/Fonts/NewYork.ttf"),
+}
 
 
-@lru_cache(maxsize=32)
-def _load_ui_font(size: int, bold: bool = False):
+UI_STYLE_PALETTES = {
+    "orange": {"accent": (68, 148, 255), "live": (92, 178, 232), "glow": (33, 46, 66)},
+    "blue": {"accent": (255, 132, 43), "live": (210, 168, 86), "glow": (54, 56, 87)},
+    "mint": {"accent": (132, 200, 45), "live": (205, 174, 80), "glow": (38, 66, 52)},
+    "violet": {"accent": (255, 105, 155), "live": (116, 190, 250), "glow": (62, 48, 78)},
+    "graphite": {"accent": (176, 166, 150), "live": (126, 182, 216), "glow": (56, 58, 64)},
+}
+
+
+@lru_cache(maxsize=96)
+def _load_ui_font(size: int, bold: bool = False, font_style: str = "rounded"):
     if ImageFont is None:
         return None
-    font_path = UI_FONT_BOLD if bold else UI_FONT_REGULAR
+    regular_path, bold_path = UI_FONT_FAMILIES.get(font_style, UI_FONT_FAMILIES["rounded"])
+    font_path = bold_path if bold else regular_path
     try:
         return ImageFont.truetype(font_path, size=size)
     except OSError:
         return ImageFont.load_default()
 
 
-@lru_cache(maxsize=1024)
-def _measure_ui_text(text: str, size: int, bold: bool = False) -> tuple[int, int]:
-    font = _load_ui_font(size, bold)
+@lru_cache(maxsize=2048)
+def _measure_ui_text(text: str, size: int, bold: bool = False, font_style: str = "rounded") -> tuple[int, int]:
+    font = _load_ui_font(size, bold, font_style)
     if font is not None and Image is not None and ImageDraw is not None:
         try:
             scratch = Image.new("RGBA", (1, 1))
@@ -87,8 +103,9 @@ def _render_ui_text_patch(
     size: int,
     color: tuple[int, int, int],
     bold: bool = False,
+    font_style: str = "rounded",
 ) -> tuple[np.ndarray, int, int] | None:
-    font = _load_ui_font(size, bold)
+    font = _load_ui_font(size, bold, font_style)
     if font is None or Image is None or ImageDraw is None:
         return None
 
@@ -253,12 +270,23 @@ class SingleWindowGazeCorrector:
         self.preview_max_size = (1280, 720)
         self._panel_origin_x = 0
         self._last_canvas_size: tuple[int, int] | None = None
+        self._pending_window_resize_size: tuple[int, int] | None = None
+        self._window_resize_retries = 0
         self.window_visible = True
         self._window_created = False
         self.control_file_path = os.environ.get("GAZE_CONTROL_FILE")
+        self.native_request_file_path = os.environ.get("SPEC3_NATIVE_REQUEST_FILE")
         self.log_file_path = os.environ.get("SPEC3_LOG_FILE") or os.path.expanduser(
             "~/Library/Logs/spec3 correction.log"
         )
+        self.preferences_file_path = os.environ.get("SPEC3_PREFERENCES_FILE") or os.path.expanduser(
+            "~/Library/Application Support/spec3 correction/preferences.json"
+        )
+        self._preferences_mtime = 0.0
+        self._ui_theme = "dark"
+        self._ui_language = "en"
+        self._ui_style = "orange"
+        self._ui_font_style = "rounded"
         self._last_control_mtime = 0.0
         self._pending_hide_window = False
         self._pending_show_window = False
@@ -406,7 +434,8 @@ class SingleWindowGazeCorrector:
     def toggle_camera_dropdown(self) -> None:
         self.camera_dropdown_open = not self.camera_dropdown_open
         if self.camera_dropdown_open:
-            self.refresh_camera_options(force=False, async_refresh=True)
+            self.refresh_camera_options(force=True, async_refresh=True)
+            self.logger.log("Camera dropdown opened")
 
     def request_camera_select(self, camera_id: int, label: str) -> None:
         """Queue a camera switch from the UI; applied in the main loop."""
@@ -470,7 +499,7 @@ class SingleWindowGazeCorrector:
         return "..."
 
     def _measure_text(self, text: str, size: int, bold: bool = False) -> tuple[int, int]:
-        return _measure_ui_text(text, size, bold)
+        return _measure_ui_text(text, size, bold, self._ui_font_style)
 
     def _draw_text(
         self,
@@ -482,7 +511,7 @@ class SingleWindowGazeCorrector:
         bold: bool = False,
     ) -> None:
         """Draw sharper macOS text with a safe OpenCV fallback."""
-        rendered = _render_ui_text_patch(text, size, tuple(color), bold)
+        rendered = _render_ui_text_patch(text, size, tuple(color), bold, self._ui_font_style)
         if rendered is None:
             scale = size / 34.0
             thickness = 2 if bold else 1
@@ -514,6 +543,42 @@ class SingleWindowGazeCorrector:
         image[dst_top:dst_bottom, dst_left:dst_right] = np.clip(
             color_bgr * alpha + roi * (1.0 - alpha), 0, 255
         ).astype(np.uint8)
+
+    def _draw_round_rect(
+        self,
+        image: np.ndarray,
+        rect: tuple[int, int, int, int],
+        color: tuple[int, int, int],
+        radius: int = 7,
+        border_color: tuple[int, int, int] | None = None,
+        border: int = 1,
+    ) -> None:
+        x1, y1, x2, y2 = rect
+        if x2 <= x1 or y2 <= y1:
+            return
+        radius = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+        if radius == 0:
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, -1)
+        else:
+            cv2.rectangle(image, (x1 + radius, y1), (x2 - radius, y2), color, -1)
+            cv2.rectangle(image, (x1, y1 + radius), (x2, y2 - radius), color, -1)
+            cv2.circle(image, (x1 + radius, y1 + radius), radius, color, -1, cv2.LINE_AA)
+            cv2.circle(image, (x2 - radius, y1 + radius), radius, color, -1, cv2.LINE_AA)
+            cv2.circle(image, (x1 + radius, y2 - radius), radius, color, -1, cv2.LINE_AA)
+            cv2.circle(image, (x2 - radius, y2 - radius), radius, color, -1, cv2.LINE_AA)
+
+        if border_color is not None and border > 0:
+            if radius == 0:
+                cv2.rectangle(image, (x1, y1), (x2, y2), border_color, border, cv2.LINE_AA)
+                return
+            cv2.line(image, (x1 + radius, y1), (x2 - radius, y1), border_color, border, cv2.LINE_AA)
+            cv2.line(image, (x1 + radius, y2), (x2 - radius, y2), border_color, border, cv2.LINE_AA)
+            cv2.line(image, (x1, y1 + radius), (x1, y2 - radius), border_color, border, cv2.LINE_AA)
+            cv2.line(image, (x2, y1 + radius), (x2, y2 - radius), border_color, border, cv2.LINE_AA)
+            cv2.ellipse(image, (x1 + radius, y1 + radius), (radius, radius), 180, 0, 90, border_color, border, cv2.LINE_AA)
+            cv2.ellipse(image, (x2 - radius, y1 + radius), (radius, radius), 270, 0, 90, border_color, border, cv2.LINE_AA)
+            cv2.ellipse(image, (x2 - radius, y2 - radius), (radius, radius), 0, 0, 90, border_color, border, cv2.LINE_AA)
+            cv2.ellipse(image, (x1 + radius, y2 - radius), (radius, radius), 90, 0, 90, border_color, border, cv2.LINE_AA)
 
     def set_correction_enabled(self, enabled: bool) -> None:
         self.gaze_correction_enabled = enabled
@@ -549,8 +614,52 @@ class SingleWindowGazeCorrector:
             self.toggle_correction()
         elif command == "logs":
             self.open_logs()
+        elif command == "training":
+            self.open_training_window()
+        elif command == "settings":
+            self.open_settings_window()
+        elif command == "record_read":
+            self.set_ai_training_label("read")
+        elif command == "record_live":
+            self.set_ai_training_label("live")
+        elif command == "record_glance":
+            self.set_ai_training_label("glance")
+        elif command == "record_stop":
+            self.set_ai_training_label(None)
+        elif command == "train_ai":
+            self.train_personal_ai()
+        elif command == "reset_training":
+            self.reset_personal_ai_samples()
         elif command == "quit":
             self.request_quit()
+
+    def refresh_preferences(self) -> None:
+        try:
+            mtime = os.path.getmtime(self.preferences_file_path)
+        except OSError:
+            return
+        if mtime <= self._preferences_mtime:
+            return
+        self._preferences_mtime = mtime
+        try:
+            with open(self.preferences_file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        theme = str(data.get("theme", "dark")).lower()
+        language = str(data.get("language", "en")).lower()
+        style = str(data.get("style", "orange")).lower()
+        font_style = str(data.get("font", "rounded")).lower()
+        self._ui_theme = "light" if theme == "light" else "dark"
+        self._ui_language = "ru" if language == "ru" else "en"
+        self._ui_style = style if style in UI_STYLE_PALETTES else "orange"
+        self._ui_font_style = font_style if font_style in UI_FONT_FAMILIES else "rounded"
+
+    def tr(self, en: str, ru: str) -> str:
+        return ru if self._ui_language == "ru" else en
+
+    def _ui_palette(self) -> dict[str, tuple[int, int, int]]:
+        return UI_STYLE_PALETTES.get(self._ui_style, UI_STYLE_PALETTES["orange"])
 
     def compose_app_frame(self, frame: np.ndarray) -> np.ndarray:
         """Compose the camera preview and the control panel into one window."""
@@ -562,7 +671,8 @@ class SingleWindowGazeCorrector:
         preview_h = max(1, int(frame_h * scale))
 
         if (preview_w, preview_h) != (frame_w, frame_h):
-            preview = cv2.resize(frame, (preview_w, preview_h), interpolation=cv2.INTER_LINEAR)
+            interpolation = cv2.INTER_AREA if preview_w < frame_w or preview_h < frame_h else cv2.INTER_LINEAR
+            preview = cv2.resize(frame, (preview_w, preview_h), interpolation=interpolation)
         else:
             preview = frame
 
@@ -585,127 +695,242 @@ class SingleWindowGazeCorrector:
         if self._last_canvas_size != canvas_size:
             cv2.resizeWindow(self.display_cfg.window_name, canvas_w, canvas_h)
             self._last_canvas_size = canvas_size
+            self._pending_window_resize_size = canvas_size
+            self._window_resize_retries = 12
+            self.logger.log(f"Window canvas size set to {canvas_w}x{canvas_h}")
 
         return canvas
 
+    def _apply_pending_window_resize(self) -> None:
+        if self._pending_window_resize_size is None or self._window_resize_retries <= 0:
+            return
+        width, height = self._pending_window_resize_size
+        try:
+            cv2.resizeWindow(self.display_cfg.window_name, width, height)
+        except cv2.error:
+            return
+        self._window_resize_retries -= 1
+        if self._window_resize_retries <= 0:
+            self._pending_window_resize_size = None
+
     def draw_control_panel(self, canvas: np.ndarray, x0: int, height: int) -> None:
         """Draw the integrated control panel on the right side of the app."""
+        self.refresh_preferences()
         tuning = self.gaze_corrector.get_tuning()
         reading_active, reading_score, effective_hold = self.gaze_corrector.get_reading_state()
+        personal_ai = self.gaze_corrector.get_personal_ai_state()
         panel_w = self.control_panel_width
         x1 = x0 + panel_w
+        compact = height <= 760
+        margin = 24 if compact else 28
+        left = x0 + margin
+        right = x1 - margin
         self._slider_regions.clear()
         self._button_regions.clear()
 
-        panel_bg = (18, 19, 23)
-        header_bg = (25, 25, 31)
-        card_bg = (31, 31, 38)
-        card_line = (66, 66, 78)
-        muted = (158, 164, 176)
-        text = (242, 245, 250)
-        accent = (43, 132, 255)
-        live_accent = (232, 178, 92)
+        light = self._ui_theme == "light"
+        panel_bg = (238, 241, 245) if light else (18, 19, 23)
+        header_bg = (249, 250, 252) if light else (25, 25, 31)
+        card_bg = (255, 255, 255) if light else (31, 31, 38)
+        card_line = (205, 211, 220) if light else (66, 66, 78)
+        muted = (95, 101, 112) if light else (158, 164, 176)
+        text = (28, 31, 36) if light else (242, 245, 250)
+        palette = self._ui_palette()
+        accent = palette["accent"]
+        live_accent = palette["live"]
 
+        header_h = 92 if compact else 100
+        header_line_y = header_h - 1
         cv2.rectangle(canvas, (x0 + 1, 0), (x1, height), panel_bg, -1)
-        cv2.rectangle(canvas, (x0 + 1, 0), (x1, 96), header_bg, -1)
-        cv2.line(canvas, (x0 + 1, 95), (x1, 95), (47, 51, 60), 1, cv2.LINE_AA)
-        cv2.line(canvas, (x0 + 28, 82), (x0 + 392, 82), (43, 47, 56), 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (x0 + 1, 0), (x1, header_h), header_bg, -1)
+        line_color = (210, 215, 224) if light else (47, 51, 60)
+        cv2.line(canvas, (x0 + 1, header_line_y), (x1, header_line_y), line_color, 1, cv2.LINE_AA)
+        cv2.line(canvas, (left, header_h - 16), (right, header_h - 16), line_color, 1, cv2.LINE_AA)
 
-        title_x = x0 + 28
-        cv2.circle(canvas, (title_x + 6, 36), 5, accent, -1, cv2.LINE_AA)
-        cv2.circle(canvas, (title_x + 6, 36), 9, (54, 56, 87), 1, cv2.LINE_AA)
-        self._draw_text(canvas, "spec3 correction", (title_x + 22, 43), 30, text, bold=True)
-        self._draw_text(canvas, "Live gaze control", (title_x + 24, 70), 15, muted)
+        title_x = left
+        title_font = 22 if compact else 28
+        subtitle_font = 12 if compact else 13
+        title_dot_y = 32 if compact else 36
+        cv2.circle(canvas, (title_x + 6, title_dot_y), 5, accent, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (title_x + 6, title_dot_y), 9, palette["glow"], 1, cv2.LINE_AA)
+        title = self._fit_text("spec3 correction", right - title_x - (116 if compact else 150), title_font, bold=True)
+        self._draw_text(canvas, title, (title_x + 22, 39 if compact else 43), title_font, text, bold=True)
+        self._draw_text(canvas, self.tr("Live gaze control", "Живой контроль взгляда"), (title_x + 24, 62 if compact else 70), subtitle_font, muted)
 
         on_label = "ON" if tuning.enabled and self.gaze_correction_enabled else "OFF"
-        self._draw_button(canvas, "toggle", (x0 + 292, 24, x0 + 392, 62), on_label, tuning.enabled and self.gaze_correction_enabled)
+        self._draw_button(
+            canvas,
+            "toggle",
+            (right - (92 if compact else 108), 22 if compact else 24, right, 56 if compact else 62),
+            on_label,
+            tuning.enabled and self.gaze_correction_enabled,
+        )
 
-        camera_y1, camera_y2 = 106, 164
-        cv2.rectangle(canvas, (x0 + 28, camera_y1), (x0 + 392, camera_y2), card_bg, -1)
-        cv2.rectangle(canvas, (x0 + 28, camera_y1), (x0 + 392, camera_y2), (58, 62, 74), 1)
-        cv2.rectangle(canvas, (x0 + 28, camera_y1), (x0 + 33, camera_y2), (74, 82, 96), -1)
-        self._draw_text(canvas, "Camera", (x0 + 46, camera_y1 + 24), 15, muted, bold=True)
-        camera_text = self._fit_text(self._short_camera_label(34), 222, 16)
-        self._draw_text(canvas, camera_text, (x0 + 118, camera_y1 + 24), 16, text, bold=True)
-        self._draw_text(canvas, self._camera_status_text(), (x0 + 118, camera_y1 + 47), 12, (150, 158, 170))
+        camera_y1, camera_y2 = (108, 158) if compact else (116, 174)
+        self._draw_round_rect(canvas, (left, camera_y1, right, camera_y2), card_bg, 5, card_line)
+        cv2.rectangle(canvas, (left, camera_y1 + 1), (left + 5, camera_y2 - 1), (92, 86, 82) if not light else (190, 174, 160), -1)
+        self._draw_text(canvas, self.tr("Camera", "Камера"), (left + 16, camera_y1 + 22), 13 if compact else 14, muted, bold=True)
+        name_x = left + (108 if compact else 142)
+        camera_text = self._fit_text(self._short_camera_label(32), right - name_x - 34, 14 if compact else 15, bold=True)
+        self._draw_text(canvas, camera_text, (name_x, camera_y1 + 22), 14 if compact else 15, text, bold=True)
+        self._draw_text(canvas, self._camera_status_text(), (name_x, camera_y1 + 40), 10 if compact else 11, (150, 158, 170))
         chevron = "^" if self.camera_dropdown_open else "v"
-        self._draw_text(canvas, chevron, (x0 + 369, camera_y1 + 25), 15, muted, bold=True)
-        self._button_regions["camera_toggle"] = (x0 + 28, camera_y1, x0 + 392, camera_y2)
+        self._draw_text(canvas, chevron, (right - 20, camera_y1 + 23), 14, muted, bold=True)
+        self._button_regions["camera_toggle"] = (left, camera_y1, right, camera_y2)
 
         mode_label = "READ" if reading_active else "LIVE"
         mode_color = accent if reading_active else live_accent
-        mode_y1, mode_y2 = 178, 238
-        cv2.rectangle(canvas, (x0 + 28, mode_y1), (x0 + 392, mode_y2), card_bg, -1)
-        cv2.rectangle(canvas, (x0 + 28, mode_y1), (x0 + 392, mode_y2), card_line, 1)
-        cv2.rectangle(canvas, (x0 + 28, mode_y1), (x0 + 33, mode_y2), mode_color, -1)
-        self._draw_text(canvas, "Adaptive mode", (x0 + 46, mode_y1 + 27), 17, (218, 223, 232))
-        self._draw_text(canvas, mode_label, (x0 + 298, mode_y1 + 27), 20, mode_color, bold=True)
-        self._draw_meter(canvas, x0 + 46, mode_y1 + 45, x0 + 216, reading_score, "read")
-        self._draw_meter(canvas, x0 + 230, mode_y1 + 45, x0 + 374, effective_hold, "hold")
+        mode_y1, mode_y2 = (170, 224) if compact else (188, 252)
+        self._draw_round_rect(canvas, (left, mode_y1, right, mode_y2), card_bg, 5, card_line)
+        cv2.rectangle(canvas, (left, mode_y1 + 1), (left + 5, mode_y2 - 1), mode_color, -1)
+        mode_title = self._fit_text(self.tr("Adaptive mode", "Адаптивный режим"), right - left - 150, 15)
+        self._draw_text(canvas, mode_title, (left + 16, mode_y1 + 23), 14 if compact else 15, text)
+        self._draw_text(canvas, mode_label, (right - 82, mode_y1 + 24), 16 if compact else 18, mode_color, bold=True)
+        self._draw_meter(canvas, left + 16, mode_y1 + 43, left + 188, reading_score, "read")
+        self._draw_meter(canvas, left + 208, mode_y1 + 43, right - 16, effective_hold, "hold")
 
         sliders = [
-            ("strength", "Strength", tuning.strength * 100.0, 0.0, 150.0, "%"),
-            ("vertical", "Eyes Up / Down", tuning.vertical_offset, -90.0, 90.0, " deg"),
-            ("horizontal", "Eyes Left / Right", tuning.horizontal_offset, -45.0, 45.0, " deg"),
-            ("smooth", "Smooth", tuning.smoothing * 100.0, 0.0, 100.0, "%"),
-            ("stabilizer", "Pupil Hold", tuning.reading_stabilizer * 100.0, 0.0, 100.0, "%"),
-            ("live", "Live Look", tuning.natural_motion * 100.0, 0.0, 100.0, "%"),
+            ("strength", self.tr("Strength", "Сила"), tuning.strength * 100.0, 0.0, 150.0, "%"),
+            ("vertical", self.tr("Eyes Up / Down", "Глаза вверх / вниз"), tuning.vertical_offset, -90.0, 90.0, " deg"),
+            ("horizontal", self.tr("Eyes Left / Right", "Глаза влево / вправо"), tuning.horizontal_offset, -45.0, 45.0, " deg"),
+            ("smooth", self.tr("Smooth", "Плавность"), tuning.smoothing * 100.0, 0.0, 100.0, "%"),
+            ("stabilizer", self.tr("Pupil Hold", "Фиксация зрачков"), tuning.reading_stabilizer * 100.0, 0.0, 100.0, "%"),
+            ("live", self.tr("Live Look", "Живой взгляд"), tuning.natural_motion * 100.0, 0.0, 100.0, "%"),
         ]
 
-        track_x1 = x0 + 34
-        track_x2 = x0 + 286
-        y = 272
+        row1_y = height - (82 if compact else 88)
+        row2_y = row1_y + (40 if compact else 44)
+        ai_y1 = row1_y - (116 if compact else 100)
+        ai_y2 = row1_y - 12
+
+        track_x1 = left + 4
+        track_x2 = right - (104 if compact else 112)
+        y = 248 if compact else 284
+        slider_step = 43 if compact else 54
         for key, label, value, min_value, max_value, suffix in sliders:
             self._draw_slider(canvas, key, label, value, min_value, max_value, suffix, y, track_x1, track_x2)
-            y += 56
+            y += slider_step
 
-        button_y = min(height - 94, 626)
-        self._draw_button(canvas, "app_quit", (x0 + 28, button_y, x0 + 104, button_y + 42), "Quit", False, danger=True)
-        self._draw_button(canvas, "logs", (x0 + 116, button_y, x0 + 194, button_y + 42), "Logs", False)
-        self._draw_button(canvas, "reset", (x0 + 206, button_y, x0 + 292, button_y + 42), "Reset", False)
-        self._draw_button(canvas, "hide", (x0 + 308, button_y, x0 + 392, button_y + 42), "Hide", False)
+        self._draw_personal_ai_panel(canvas, left, right, ai_y1, ai_y2, personal_ai)
 
-        footer_y = min(height - 28, button_y + 78)
-        self._draw_text(canvas, "Menu bar controls window and correction", (x0 + 28, footer_y), 12, (138, 147, 160))
+        gap = 10
+        col_w = (right - left - gap * 2) // 3
+        button_h = 34 if compact else 36
+        self._draw_button(canvas, "app_quit", (left, row1_y, left + col_w, row1_y + button_h), self.tr("Quit", "Выход"), False, danger=True)
+        self._draw_button(canvas, "logs", (left + col_w + gap, row1_y, left + col_w * 2 + gap, row1_y + button_h), self.tr("Logs", "Логи"), False)
+        self._draw_button(canvas, "settings", (left + col_w * 2 + gap * 2, row1_y, right, row1_y + button_h), self.tr("Settings", "Настройки"), False)
+        half_w = (right - left - gap) // 2
+        self._draw_button(canvas, "reset", (left, row2_y, left + half_w, row2_y + 32), self.tr("Reset", "Сброс"), False)
+        self._draw_button(canvas, "hide", (left + half_w + gap, row2_y, right, row2_y + 32), self.tr("Hide", "Скрыть"), False)
         if self.camera_dropdown_open:
-            self._draw_camera_dropdown(canvas, x0, camera_y2 + 6)
+            self._draw_camera_dropdown(canvas, left, right, camera_y2 + 8)
 
-    def _draw_camera_dropdown(self, canvas: np.ndarray, x0: int, y: int) -> None:
+    def _draw_personal_ai_panel(
+        self,
+        canvas: np.ndarray,
+        left: int,
+        right: int,
+        y1: int,
+        y2: int,
+        state: dict[str, object],
+    ) -> None:
+        light = self._ui_theme == "light"
+        card_bg = (255, 255, 255) if light else (31, 31, 38)
+        card_line = (205, 211, 220) if light else (66, 66, 78)
+        primary = (35, 39, 46) if light else (230, 234, 242)
+        secondary = (92, 99, 112) if light else (164, 171, 184)
+        muted = (112, 120, 134) if light else (138, 147, 160)
+        accent = self._ui_palette()["accent"]
+        recording_label = state.get("recording_label")
+        samples = state.get("samples") if isinstance(state.get("samples"), dict) else {}
+        training_pool = state.get("training_pool") if isinstance(state.get("training_pool"), dict) else {}
+        has_model = bool(state.get("has_model"))
+        probability = state.get("personal_probability")
+        model_samples = int(state.get("model_samples") or 0)
+        model_accuracy = float(state.get("model_accuracy") or 0.0)
+        status = str(state.get("last_status") or "")
+        if len(status) > 46:
+            status = status[:43] + "..."
+
+        model_text = self.tr("model ON", "модель готова") if has_model else self.tr("collect data", "соберите данные")
+        if has_model and model_accuracy > 0:
+            model_text = f"AI {model_accuracy * 100:.0f}%"
+        if isinstance(probability, (int, float)) and not has_model:
+            model_text = f"AI {float(probability) * 100:.0f}%"
+        read_count = int(samples.get("read", 0)) if isinstance(samples, dict) else 0
+        live_count = int(samples.get("live", 0)) if isinstance(samples, dict) else 0
+        look_count = int(samples.get("glance", 0)) if isinstance(samples, dict) else 0
+        pool_total = 0
+        if isinstance(training_pool, dict):
+            pool_total = (
+                int(training_pool.get("read", 0))
+                + int(training_pool.get("live", 0))
+                + int(training_pool.get("glance", 0))
+            )
+
+        self._draw_round_rect(canvas, (left, y1, right, y2), card_bg, 5, card_line)
+        cv2.rectangle(canvas, (left, y1 + 1), (left + 5, y2 - 1), accent if has_model else (84, 88, 102), -1)
+
+        model_text = self._fit_text(model_text, 150, 13, bold=True)
+        model_width = self._measure_text(model_text, 13, bold=True)[0]
+        self._draw_text(canvas, "Personal AI", (left + 18, y1 + 24), 16, primary, bold=True)
+        self._draw_text(canvas, model_text, (right - 18 - model_width, y1 + 24), 13, accent, bold=True)
+        target = int(state.get("target_per_label") or 300)
+        sample_text = self.tr(
+            f"new read {read_count}/{target}  live {live_count}/{target}  look {look_count}/{target}",
+            f"новые: чтение {read_count}/{target} live {live_count}/{target} взгляд {look_count}/{target}",
+        )
+        if pool_total > 0 and model_samples > 0:
+            status = self.tr(
+                f"History {pool_total} samples, model {model_samples}",
+                f"История {pool_total}, модель {model_samples}",
+            )
+        sample_text = self._fit_text(sample_text, right - left - 142, 11)
+        status = self._fit_text(status, right - left - 142, 11)
+        self._draw_text(canvas, sample_text, (left + 18, y1 + 46), 11, secondary)
+        self._draw_text(canvas, status, (left + 18, y1 + 66), 11, muted)
+
+        self._draw_button(canvas, "ai_training", (right - 114, y1 + 44, right - 14, y1 + 70), self.tr("Train", "Обучение"), bool(recording_label))
+
+    def _draw_camera_dropdown(self, canvas: np.ndarray, left: int, right: int, y: int) -> None:
         """Draw the camera dropdown over the rest of the control panel."""
         with self._camera_refresh_lock:
             camera_options = list(self.camera_options)
             camera_refreshing = self._camera_refreshing
 
-        x1 = x0 + 28
-        x2 = x0 + 392
-        row_h = 36
-        max_rows = min(len(camera_options), 6) if camera_options else 1
+        x1 = left
+        x2 = right
+        row_h = 34
+        max_rows = min(len(camera_options), 5) if camera_options else 1
         dropdown_h = max(1, max_rows) * row_h + 10
         bottom = y + dropdown_h
 
-        cv2.rectangle(canvas, (x1 + 4, y + 5), (x2 + 4, bottom + 5), (9, 10, 13), -1)
-        cv2.rectangle(canvas, (x1, y), (x2, bottom), (24, 24, 30), -1)
-        cv2.rectangle(canvas, (x1, y), (x2, bottom), (82, 86, 98), 1)
+        light = self._ui_theme == "light"
+        dropdown_bg = (249, 250, 252) if light else (24, 24, 30)
+        dropdown_line = (198, 205, 217) if light else (82, 86, 98)
+        self._draw_round_rect(canvas, (x1, y, x2, bottom), dropdown_bg, 5, dropdown_line)
 
         if not camera_options:
             label = "Scanning cameras..." if camera_refreshing else "No cameras found"
-            self._draw_text(canvas, label, (x1 + 18, y + 28), 15, (218, 222, 230))
+            color = (70, 76, 88) if light else (218, 222, 230)
+            self._draw_text(canvas, label, (x1 + 18, y + 28), 14, color)
             return
 
         for index, camera in enumerate(camera_options[:max_rows]):
             row_y1 = y + 5 + index * row_h
             row_y2 = row_y1 + row_h
             active = camera.id == self.camera_id
-            hover_bg = (39, 37, 34) if not active else (48, 41, 35)
-            cv2.rectangle(canvas, (x1 + 6, row_y1), (x2 - 6, row_y2), hover_bg, -1)
+            hover_bg = (237, 240, 245) if light else (39, 37, 34)
+            active_bg = (230, 235, 245) if light else (48, 41, 35)
+            self._draw_round_rect(canvas, (x1 + 6, row_y1, x2 - 6, row_y2), active_bg if active else hover_bg, 4)
             if active:
-                cv2.circle(canvas, (x1 + 20, row_y1 + 18), 5, (43, 132, 255), -1, cv2.LINE_AA)
+                cv2.circle(canvas, (x1 + 20, row_y1 + 18), 5, self._ui_palette()["accent"], -1, cv2.LINE_AA)
 
-            name = self._fit_text(camera.name, 250, 15, bold=active)
-            name_color = (248, 248, 250) if active else (218, 222, 230)
-            self._draw_text(canvas, name, (x1 + 34, row_y1 + 23), 15, name_color, bold=active)
-            id_text = f"#{camera.id}"
-            self._draw_text(canvas, id_text, (x2 - 38, row_y1 + 23), 13, (146, 152, 164))
+            name = self._fit_text(camera.name, x2 - x1 - 108, 14, bold=active)
+            name_color = (35, 39, 46) if light else ((248, 248, 250) if active else (218, 222, 230))
+            self._draw_text(canvas, name, (x1 + 34, row_y1 + 22), 14, name_color, bold=active)
+            id_text = f"slot #{camera.id}"
+            self._draw_text(canvas, id_text, (x2 - 62, row_y1 + 22), 12, (146, 152, 164))
             self._button_regions[f"camera_option:{camera.id}"] = (x1 + 6, row_y1, x2 - 6, row_y2)
 
     def _clamp_to_preview(self, x: int, y: int) -> tuple[int, int] | None:
@@ -833,7 +1058,8 @@ class SingleWindowGazeCorrector:
             return
 
         x, y = point
-        color = (255, 148, 72) if self._dragging_preview_aim else (232, 178, 92)
+        palette = self._ui_palette()
+        color = palette["accent"] if self._dragging_preview_aim else palette["live"]
         shadow = (12, 13, 16)
 
         if self._aim_target_offsets is not None:
@@ -852,7 +1078,7 @@ class SingleWindowGazeCorrector:
         self._draw_text(panel, label, (x1, y - 8), 12, (148, 157, 170))
         cv2.line(panel, (x1 + 44, y - 11), (x2, y - 11), (64, 70, 84), 5, cv2.LINE_AA)
         fill_x = int((x1 + 44) + value * (x2 - (x1 + 44)))
-        cv2.line(panel, (x1 + 44, y - 11), (fill_x, y - 11), (43, 132, 255), 5, cv2.LINE_AA)
+        cv2.line(panel, (x1 + 44, y - 11), (fill_x, y - 11), self._ui_palette()["accent"], 5, cv2.LINE_AA)
 
     def reset_settings_panel(self) -> None:
         """Reset tuning sliders and saved tuning values."""
@@ -873,6 +1099,9 @@ class SingleWindowGazeCorrector:
             if not os.path.exists(log_path):
                 with open(log_path, "a", encoding="utf-8"):
                     pass
+            if self._send_native_request("logs"):
+                self.logger.log("Requested native log viewer")
+                return
             subprocess.run(
                 ["open", "-b", "local.spec3-correction", "spec3correction://logs"],
                 check=True,
@@ -887,6 +1116,52 @@ class SingleWindowGazeCorrector:
             subprocess.Popen(["open", log_path])
             self.logger.log(f"Opened raw log fallback: {log_path}")
 
+    def open_training_window(self) -> None:
+        if self._send_native_request("training"):
+            self.logger.log("Requested native training window")
+            return
+        try:
+            subprocess.run(
+                ["open", "-b", "local.spec3-correction", "spec3correction://training"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            )
+            self.logger.log("Requested native training window")
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
+            self.logger.log(f"Could not open training window: {exc}")
+
+    def open_settings_window(self) -> None:
+        if self._send_native_request("settings"):
+            self.logger.log("Requested native settings window")
+            return
+        try:
+            subprocess.run(
+                ["open", "-b", "local.spec3-correction", "spec3correction://settings"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            )
+            self.logger.log("Requested native settings window")
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
+            self.logger.log(f"Could not open settings window: {exc}")
+
+    def _send_native_request(self, command: str) -> bool:
+        if not self.native_request_file_path:
+            return False
+        try:
+            os.makedirs(os.path.dirname(self.native_request_file_path), exist_ok=True)
+            tmp_path = f"{self.native_request_file_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(f"{command}\n{time.time():.6f}\n")
+            os.replace(tmp_path, self.native_request_file_path)
+            return True
+        except OSError as exc:
+            self.logger.log(f"Could not send native request {command}: {exc}")
+            return False
+
     def request_app_quit(self) -> None:
         self.should_quit = True
         try:
@@ -900,6 +1175,18 @@ class SingleWindowGazeCorrector:
         except OSError as exc:
             self.logger.log(f"Could not ask native app to quit: {exc}")
 
+    def set_ai_training_label(self, label: str | None) -> None:
+        message = self.gaze_corrector.set_personal_training_label(label)
+        self.logger.log(message)
+
+    def train_personal_ai(self) -> None:
+        message = self.gaze_corrector.train_personal_reading_model()
+        self.logger.log(message)
+
+    def reset_personal_ai_samples(self) -> None:
+        message = self.gaze_corrector.reset_personal_training_samples()
+        self.logger.log(message)
+
     def _draw_button(
         self,
         panel: np.ndarray,
@@ -910,22 +1197,22 @@ class SingleWindowGazeCorrector:
         danger: bool = False,
     ) -> None:
         x1, y1, x2, y2 = rect
-        color = (58, 63, 74)
-        border = (88, 96, 110)
-        text_color = (243, 246, 250)
+        light = self._ui_theme == "light"
+        color = (226, 230, 238) if light else (58, 63, 74)
+        border = (191, 198, 211) if light else (88, 96, 110)
+        text_color = (30, 34, 42) if light else (243, 246, 250)
         if active:
-            color = (43, 111, 216)
-            border = (80, 164, 255)
+            color = self._ui_palette()["accent"]
+            border = tuple(min(c + 36, 255) for c in color)
+            text_color = (255, 255, 255)
         if danger:
-            color = (82, 66, 72)
-            border = (152, 104, 113)
-            text_color = (250, 239, 242)
+            color = (248, 221, 224) if light else (82, 66, 72)
+            border = (214, 106, 116) if light else (152, 104, 113)
+            text_color = (108, 32, 42) if light else (250, 239, 242)
 
-        cv2.rectangle(panel, (x1 + 2, y1 + 3), (x2 + 2, y2 + 3), (11, 12, 15), -1)
-        cv2.rectangle(panel, (x1, y1), (x2, y2), color, -1)
-        cv2.line(panel, (x1 + 1, y1), (x2 - 1, y1), tuple(min(c + 24, 255) for c in color), 1, cv2.LINE_AA)
-        cv2.rectangle(panel, (x1, y1), (x2, y2), border, 1)
-        font_size = 18
+        self._draw_round_rect(panel, (x1, y1, x2, y2), color, 5, border)
+        cv2.line(panel, (x1 + 7, y1 + 1), (x2 - 7, y1 + 1), tuple(min(c + 18, 255) for c in color), 1, cv2.LINE_AA)
+        font_size = 16
         while font_size > 12:
             text_size = self._measure_text(label, font_size)
             if text_size[0] <= x2 - x1 - 14:
@@ -949,26 +1236,30 @@ class SingleWindowGazeCorrector:
         x1: int = 30,
         x2: int = 380,
     ) -> None:
-        track_y = y + 28
+        light = self._ui_theme == "light"
+        track_y = y + 24
         value = max(min_value, min(value, max_value))
         ratio = 0.0 if max_value == min_value else (value - min_value) / (max_value - min_value)
         knob_x = int(x1 + ratio * (x2 - x1))
 
-        self._draw_text(panel, label, (x1, y), 17, (224, 229, 238))
+        label_color = (35, 39, 46) if light else (224, 229, 238)
+        track_color = (205, 211, 220) if light else (58, 62, 72)
+        zero_color = (155, 162, 174) if light else (88, 94, 108)
+        self._draw_text(panel, label, (x1, y), 14, label_color)
         value_text = f"{value:+.0f}{suffix}" if min_value < 0 else f"{value:.0f}{suffix}"
-        self._draw_text(panel, value_text, (x2 + 18, y), 16, (91, 178, 255), bold=True)
-        cv2.line(panel, (x1, track_y), (x2, track_y), (58, 62, 72), 8, cv2.LINE_AA)
-        fill_color = (43, 132, 255)
+        fill_color = self._ui_palette()["accent"]
+        self._draw_text(panel, value_text, (x2 + 16, y), 14, fill_color, bold=True)
+        cv2.line(panel, (x1, track_y), (x2, track_y), track_color, 5, cv2.LINE_AA)
         if min_value < 0 < max_value:
             zero_ratio = (0.0 - min_value) / (max_value - min_value)
             zero_x = int(x1 + zero_ratio * (x2 - x1))
-            cv2.line(panel, (zero_x, track_y - 10), (zero_x, track_y + 10), (88, 94, 108), 1, cv2.LINE_AA)
-            cv2.line(panel, (zero_x, track_y), (knob_x, track_y), fill_color, 8, cv2.LINE_AA)
+            cv2.line(panel, (zero_x, track_y - 9), (zero_x, track_y + 9), zero_color, 1, cv2.LINE_AA)
+            cv2.line(panel, (zero_x, track_y), (knob_x, track_y), fill_color, 5, cv2.LINE_AA)
         else:
-            cv2.line(panel, (x1, track_y), (knob_x, track_y), fill_color, 8, cv2.LINE_AA)
-        cv2.circle(panel, (knob_x, track_y), 13, (12, 13, 16), -1, cv2.LINE_AA)
-        cv2.circle(panel, (knob_x, track_y), 10, (238, 243, 240), -1, cv2.LINE_AA)
-        cv2.circle(panel, (knob_x, track_y), 12, fill_color, 2, cv2.LINE_AA)
+            cv2.line(panel, (x1, track_y), (knob_x, track_y), fill_color, 5, cv2.LINE_AA)
+        cv2.circle(panel, (knob_x, track_y), 10, (12, 13, 16), -1, cv2.LINE_AA)
+        cv2.circle(panel, (knob_x, track_y), 7, (238, 243, 240), -1, cv2.LINE_AA)
+        cv2.circle(panel, (knob_x, track_y), 9, fill_color, 2, cv2.LINE_AA)
         self._slider_regions[key] = (x1, track_y, x2, min_value, max_value)
 
     def handle_settings_mouse(self, event: int, x: int, y: int, _flags: int, _param) -> None:
@@ -1034,6 +1325,12 @@ class SingleWindowGazeCorrector:
             return
         elif key == "logs":
             self.open_logs()
+            return
+        elif key == "settings":
+            self.open_settings_window()
+            return
+        elif key == "ai_training":
+            self.open_training_window()
             return
         elif key == "reset":
             self.reset_settings_panel()
@@ -1386,8 +1683,8 @@ class SingleWindowGazeCorrector:
                 self.logger.log(f"Camera {camera_id} did not open with {backend_name}")
                 continue
 
-            requested_w = min(self.display_cfg.video_size[0], self.display_cfg.processing_max_size[0])
-            requested_h = min(self.display_cfg.video_size[1], self.display_cfg.processing_max_size[1])
+            requested_w = max(1280, min(self.display_cfg.video_size[0], self.display_cfg.processing_max_size[0]))
+            requested_h = max(720, min(self.display_cfg.video_size[1], self.display_cfg.processing_max_size[1]))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, requested_w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, requested_h)
             cap.set(cv2.CAP_PROP_FPS, 30)
@@ -1420,7 +1717,9 @@ class SingleWindowGazeCorrector:
                     )
                     continue
 
-            self.logger.log(f"Camera {camera_id} opened with {backend_name}")
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.logger.log(f"Camera {camera_id} opened with {backend_name} at {actual_w}x{actual_h}")
             return cap
 
         return None
@@ -1429,11 +1728,12 @@ class SingleWindowGazeCorrector:
         self,
         camera_id: Optional[int] = None,
         requested_label: str = "",
+        allow_remap: bool = True,
     ):
         """Open the requested camera, remapping to a live slot if macOS names are out of order."""
         preferred_id = self.camera_id if camera_id is None else camera_id
         label = requested_label or self._camera_label_overrides.get(preferred_id, "")
-        allow_fallback = not label or not is_virtual_camera_name(label)
+        allow_fallback = allow_remap and (not label or not is_virtual_camera_name(label))
         candidates = self._camera_candidate_ids(preferred_id, label) if allow_fallback else [preferred_id]
 
         for candidate_id in candidates:
@@ -1478,7 +1778,11 @@ class SingleWindowGazeCorrector:
             return stream
 
         self.logger.log(f"Switching camera {self.camera_id} -> {next_camera_id}")
-        next_cap, actual_camera_id = self._open_camera_capture(next_camera_id, requested_label)
+        next_cap, actual_camera_id = self._open_camera_capture(
+            next_camera_id,
+            requested_label,
+            allow_remap=False,
+        )
         if next_cap is None:
             self.logger.log(f"Could not switch to camera {next_camera_id}")
             self.camera_label = self._camera_label_overrides.get(
@@ -1564,6 +1868,7 @@ class SingleWindowGazeCorrector:
                     self.create_settings_panel()
                 app_frame = self.compose_app_frame(display_frame)
                 cv2.imshow(self.display_cfg.window_name, app_frame)
+                self._apply_pending_window_resize()
                 try:
                     if cv2.getWindowProperty(self.display_cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
                         self.logger.log("Main window hidden")
@@ -1592,6 +1897,16 @@ class SingleWindowGazeCorrector:
             elif key_ascii in (ord("r"), ord("R")):
                 self.reset_settings_panel()
                 self.logger.log("Gaze tuning reset to default")
+            elif key_ascii == ord("1"):
+                self.set_ai_training_label("read")
+            elif key_ascii == ord("2"):
+                self.set_ai_training_label("live")
+            elif key_ascii == ord("3"):
+                self.set_ai_training_label("glance")
+            elif key_ascii == ord("0"):
+                self.set_ai_training_label(None)
+            elif key_ascii in (ord("t"), ord("T")):
+                self.train_personal_ai()
             elif self.calibration_mode:
                 self.handle_calibration_key(key)
 
