@@ -1692,14 +1692,27 @@ class SingleWindowGazeCorrector:
 
     def _camera_candidate_ids(self, preferred_id: int, requested_label: str) -> list[int]:
         candidates: list[int] = []
-
-        def add(candidate_id: int) -> None:
-            if candidate_id >= 0 and candidate_id not in candidates:
-                candidates.append(candidate_id)
-
-        add(preferred_id)
         with self._camera_refresh_lock:
             camera_options = list(self.camera_options)
+        virtual_ids = {
+            camera.id for camera in camera_options if is_virtual_camera_name(camera.name)
+        }
+        logged_virtual_skips: set[int] = set()
+        prefer_physical = bool(requested_label) and not is_virtual_camera_name(requested_label)
+
+        def add(candidate_id: int) -> None:
+            if candidate_id < 0 or candidate_id in candidates:
+                return
+            if prefer_physical and candidate_id in virtual_ids:
+                if candidate_id not in logged_virtual_skips:
+                    self.logger.log(
+                        f"Skipping virtual camera slot {candidate_id} for {requested_label}"
+                    )
+                    logged_virtual_skips.add(candidate_id)
+                return
+            candidates.append(candidate_id)
+
+        add(preferred_id)
 
         physical_first = sorted(
             camera_options,
@@ -1788,6 +1801,16 @@ class SingleWindowGazeCorrector:
         candidates = self._camera_candidate_ids(preferred_id, label) if allow_fallback else [preferred_id]
 
         for candidate_id in candidates:
+            candidate_label = self._camera_label_overrides.get(
+                candidate_id,
+                camera_name(candidate_id, self.camera_options),
+            )
+            if label and not is_virtual_camera_name(label) and is_virtual_camera_name(candidate_label):
+                self.logger.log(
+                    f"Skipping virtual camera slot {candidate_id} ({candidate_label}) "
+                    f"for requested physical camera {label}"
+                )
+                continue
             cap = self._open_camera_capture_direct(candidate_id, require_live_frame=True)
             if cap is not None:
                 if candidate_id != preferred_id:
@@ -1797,6 +1820,17 @@ class SingleWindowGazeCorrector:
                         f"Camera slot remapped: requested {preferred_id}, opened {candidate_id}"
                     )
                 return cap, candidate_id
+
+        preferred_label = self._camera_label_overrides.get(
+            preferred_id,
+            camera_name(preferred_id, self.camera_options),
+        )
+        if label and not is_virtual_camera_name(label) and is_virtual_camera_name(preferred_label):
+            self.logger.log(
+                f"Not falling back to virtual camera slot {preferred_id} "
+                f"({preferred_label}) for requested physical camera {label}"
+            )
+            return None, preferred_id
 
         cap = self._open_camera_capture_direct(preferred_id, require_live_frame=False)
         if cap is not None:
@@ -1857,6 +1891,52 @@ class SingleWindowGazeCorrector:
         self.gaze_corrector.reset_tracking()
         return CameraFrameStream(next_cap, self.logger)
 
+    def _recover_camera_stream(self, stream: CameraFrameStream, reason: str):
+        """Try another live slot instead of closing the app when a saved camera stalls."""
+        self.logger.log(f"{reason}; looking for another live camera slot")
+        stream.release()
+        with self._camera_refresh_lock:
+            camera_options = list(self.camera_options)
+
+        prefer_physical = not is_virtual_camera_name(self.camera_label)
+        candidates = self._camera_candidate_ids(self.camera_id, self.camera_label)
+        for camera in sorted(camera_options, key=lambda item: (is_virtual_camera_name(item.name), item.id)):
+            if prefer_physical and is_virtual_camera_name(camera.name):
+                self.logger.log(
+                    f"Skipping virtual recovery slot {camera.id} ({camera.name})"
+                )
+                continue
+            if camera.id not in candidates:
+                candidates.append(camera.id)
+
+        for candidate_id in candidates:
+            recovered_label = self._camera_label_overrides.get(
+                candidate_id,
+                camera_name(candidate_id, self.camera_options),
+            )
+            if prefer_physical and is_virtual_camera_name(recovered_label):
+                self.logger.log(
+                    f"Skipping virtual recovery slot {candidate_id} ({recovered_label})"
+                )
+                continue
+            cap = self._open_camera_capture_direct(candidate_id, require_live_frame=True)
+            if cap is None:
+                continue
+
+            previous_id = self.camera_id
+            self.camera_id = candidate_id
+            self.camera_label = recovered_label
+            self._remember_camera_label(candidate_id, self.camera_label)
+            if not is_virtual_camera_name(self.camera_label):
+                save_camera_id(candidate_id, self.camera_label)
+            self._set_camera_status(f"Recovered camera on slot #{candidate_id}", 3.0)
+            self.logger.log(f"Recovered camera stream: {previous_id} -> {candidate_id}")
+            self.gaze_corrector.reset_tracking()
+            return CameraFrameStream(cap, self.logger)
+
+        self.logger.log("Could not recover a live camera stream")
+        return None
+
     def run(self):
         """Main application loop."""
         self.logger.log(f"Starting camera {self.camera_id}...")
@@ -1866,9 +1946,9 @@ class SingleWindowGazeCorrector:
             return
         if actual_camera_id != self.camera_id:
             self.camera_id = actual_camera_id
-            self._remember_camera_label(self.camera_id, self.camera_label)
-            if not is_virtual_camera_name(self.camera_label):
-                save_camera_id(self.camera_id, self.camera_label)
+        self._remember_camera_label(self.camera_id, self.camera_label)
+        if not is_virtual_camera_name(self.camera_label):
+            save_camera_id(self.camera_id, self.camera_label)
         stream = CameraFrameStream(cap, self.logger)
 
         self.create_settings_panel()
@@ -1886,16 +1966,28 @@ class SingleWindowGazeCorrector:
             frame_id, frame, frame_age, stream_failed_reads = stream.snapshot()
             if frame is None:
                 failed_reads += 1
-                if failed_reads <= 60:
+                if failed_reads <= 240:
                     if failed_reads == 1:
                         self.logger.log("Camera returned an empty frame; waiting briefly")
                     time.sleep(0.01)
                     continue
                 self.logger.log("Failed to read frame after retries")
+                recovered = self._recover_camera_stream(stream, "Failed to read frame after retries")
+                if recovered is not None:
+                    stream = recovered
+                    failed_reads = 0
+                    last_frame_id = 0
+                    continue
                 break
             if frame_id == last_frame_id:
-                if stream_failed_reads > 60 and frame_age > 2.0:
+                if stream_failed_reads > 180 and frame_age > 4.0:
                     self.logger.log("Camera stream stopped returning fresh frames")
+                    recovered = self._recover_camera_stream(stream, "Camera stream stopped returning fresh frames")
+                    if recovered is not None:
+                        stream = recovered
+                        failed_reads = 0
+                        last_frame_id = 0
+                        continue
                     break
                 time.sleep(0.003)
                 continue

@@ -51,7 +51,7 @@ NEGATIVE_LABELS = {"live", "glance", "look"}
 VALID_LABELS = POSITIVE_LABELS | NEGATIVE_LABELS
 TARGET_SAMPLES_PER_LABEL = 300
 MIN_SAMPLES_PER_GROUP = 20
-RECORDING_WARMUP_SECONDS = 0.65
+RECORDING_WARMUP_SECONDS = 3.0
 MAX_HISTORY_FILES = 24
 
 
@@ -197,8 +197,8 @@ class PersonalReadingLearner:
         self.last_sample_time = 0.0
         if self.recording_label:
             self.last_status = (
-                f"Recording {self.recording_label.upper()} samples "
-                f"(warm-up {RECORDING_WARMUP_SECONDS:.1f}s)"
+                f"Get ready for {self.recording_label.upper()}. "
+                f"Samples start after {RECORDING_WARMUP_SECONDS:.0f}s."
             )
         else:
             self.last_status = "Recording stopped"
@@ -272,6 +272,13 @@ class PersonalReadingLearner:
         training_pool = self._count_training_pool()
         model_samples = self.model.samples if self.model else 0
         model_accuracy = self.model.training_accuracy if self.model else 0.0
+        elapsed = 0.0
+        warmup_remaining = 0.0
+        clean_recording = 0.0
+        if self.recording_label:
+            elapsed = max(0.0, time.monotonic() - self.recording_started_at)
+            warmup_remaining = max(0.0, RECORDING_WARMUP_SECONDS - elapsed)
+            clean_recording = max(0.0, elapsed - RECORDING_WARMUP_SECONDS)
         return {
             "has_model": self.has_model,
             "recording_label": self.recording_label,
@@ -285,6 +292,9 @@ class PersonalReadingLearner:
             "last_prediction": self.last_prediction,
             "last_status": self.last_status,
             "recording_warmup_seconds": RECORDING_WARMUP_SECONDS,
+            "recording_elapsed_seconds": elapsed,
+            "recording_warmup_remaining_seconds": warmup_remaining,
+            "recording_clean_seconds": clean_recording,
             "model_samples": model_samples,
             "model_accuracy": model_accuracy,
             "model_threshold": self.model.threshold if self.model else 0.0,

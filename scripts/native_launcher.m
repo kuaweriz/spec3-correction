@@ -29,6 +29,7 @@
 @property(nonatomic, strong) NSTextField *trainingPoolLabel;
 @property(nonatomic, strong) NSTextField *trainingRecordingLabel;
 @property(nonatomic, strong) NSTextField *trainingNextLabel;
+@property(nonatomic, strong) NSTextField *trainingCoachLabel;
 @property(nonatomic, strong) NSProgressIndicator *trainingReadProgress;
 @property(nonatomic, strong) NSProgressIndicator *trainingLiveProgress;
 @property(nonatomic, strong) NSProgressIndicator *trainingLookProgress;
@@ -38,8 +39,13 @@
 @property(nonatomic, strong) NSButton *trainingStopButton;
 @property(nonatomic, strong) NSButton *trainingResetButton;
 @property(nonatomic, strong) NSButton *trainingFolderButton;
+@property(nonatomic, strong) NSButton *trainingGuideButton;
 @property(nonatomic, strong) NSButton *trainingTrainButton;
 @property(nonatomic, strong) NSTimer *trainingRefreshTimer;
+@property(nonatomic, strong) NSTimer *trainingGuideTimer;
+@property(nonatomic) NSInteger trainingGuideStep;
+@property(nonatomic) NSTimeInterval trainingGuideStepStartedAt;
+@property(nonatomic) BOOL trainingGuideRunning;
 @property(nonatomic, strong) NSWindow *settingsWindow;
 @property(nonatomic, strong) NSTextField *settingsStatusLabel;
 @property(nonatomic, strong) NSTextField *settingsTitleLabel;
@@ -91,6 +97,7 @@
     self.isQuitting = YES;
     [self.logRefreshTimer invalidate];
     [self.trainingRefreshTimer invalidate];
+    [self.trainingGuideTimer invalidate];
     [self.nativeRequestTimer invalidate];
     [self stopCameraProcess];
 }
@@ -509,6 +516,7 @@
 }
 
 - (void)recordReadSamples:(id)sender {
+    [self cancelGuidedTraining:NO];
     if (!(self.task && self.task.isRunning)) {
         [self startCamera:nil];
     }
@@ -517,6 +525,7 @@
 }
 
 - (void)recordLiveSamples:(id)sender {
+    [self cancelGuidedTraining:NO];
     if (!(self.task && self.task.isRunning)) {
         [self startCamera:nil];
     }
@@ -525,6 +534,7 @@
 }
 
 - (void)recordGlanceSamples:(id)sender {
+    [self cancelGuidedTraining:NO];
     if (!(self.task && self.task.isRunning)) {
         [self startCamera:nil];
     }
@@ -533,14 +543,118 @@
 }
 
 - (void)stopRecordingSamples:(id)sender {
+    [self cancelGuidedTraining:NO];
     [self sendCommand:@"record_stop"];
     [self refreshTrainingWindowSoon];
 }
 
 - (void)trainPersonalAI:(id)sender {
+    [self cancelGuidedTraining:NO];
     if (!(self.task && self.task.isRunning)) {
         [self startCamera:nil];
     }
+    [self sendCommand:@"train_ai"];
+    [self refreshTrainingWindowSoon];
+}
+
+- (void)startGuidedTraining:(id)sender {
+    if (self.trainingGuideRunning) {
+        [self cancelGuidedTraining:YES];
+        return;
+    }
+    if (!(self.task && self.task.isRunning)) {
+        [self startCamera:nil];
+    }
+    self.trainingGuideRunning = YES;
+    self.trainingGuideStep = 0;
+    self.trainingGuideStepStartedAt = [[NSDate date] timeIntervalSinceReferenceDate];
+    [self sendCommand:@"record_read"];
+    [self.trainingGuideTimer invalidate];
+    self.trainingGuideTimer = [NSTimer scheduledTimerWithTimeInterval:0.4
+                                                               target:self
+                                                             selector:@selector(trainingGuideTick:)
+                                                             userInfo:nil
+                                                              repeats:YES];
+    [self refreshTrainingWindowSoon];
+}
+
+- (void)cancelGuidedTraining:(BOOL)stopRecording {
+    if (!self.trainingGuideRunning && !self.trainingGuideTimer) {
+        return;
+    }
+    self.trainingGuideRunning = NO;
+    self.trainingGuideStep = -1;
+    [self.trainingGuideTimer invalidate];
+    self.trainingGuideTimer = nil;
+    if (stopRecording) {
+        [self sendCommand:@"record_stop"];
+    }
+    [self refreshTrainingWindowSoon];
+}
+
+- (NSTimeInterval)guidedTrainingDurationForStep:(NSInteger)step {
+    if (step == 0) {
+        return 36.0;
+    }
+    return 26.0;
+}
+
+- (NSString *)guidedTrainingCommandForStep:(NSInteger)step {
+    if (step == 0) {
+        return @"record_read";
+    }
+    if (step == 1) {
+        return @"record_live";
+    }
+    return @"record_glance";
+}
+
+- (NSString *)guidedTrainingTitleForStep:(NSInteger)step {
+    if (step == 0) {
+        return [self textEN:@"READ" ru:@"ЧТЕНИЕ"];
+    }
+    if (step == 1) {
+        return [self textEN:@"LIVE" ru:@"ЖИВОЙ"];
+    }
+    return [self textEN:@"LOOK" ru:@"ВЗГЛЯД"];
+}
+
+- (NSString *)guidedTrainingInstructionForStep:(NSInteger)step {
+    if (step == 0) {
+        return [self textEN:@"Read centered text. Keep your head calm and do not look aside." ru:@"Читай текст по центру. Голову держи спокойно, в стороны не смотри."];
+    }
+    if (step == 1) {
+        return [self textEN:@"Look naturally at one point or the camera. Do not read text." ru:@"Смотри естественно в одну точку или камеру. Текст не читай."];
+    }
+    return [self textEN:@"Make short normal glances: left, right, up, down, then back." ru:@"Делай короткие обычные взгляды: влево, вправо, вверх, вниз и обратно."];
+}
+
+- (void)trainingGuideTick:(NSTimer *)timer {
+    if (!self.trainingGuideRunning) {
+        [timer invalidate];
+        return;
+    }
+    NSTimeInterval now = [[NSDate date] timeIntervalSinceReferenceDate];
+    NSTimeInterval elapsed = now - self.trainingGuideStepStartedAt;
+    NSTimeInterval duration = [self guidedTrainingDurationForStep:self.trainingGuideStep];
+    if (elapsed < duration) {
+        [self refreshTrainingWindow:nil];
+        return;
+    }
+
+    if (self.trainingGuideStep < 2) {
+        self.trainingGuideStep += 1;
+        self.trainingGuideStepStartedAt = now;
+        [self sendCommand:[self guidedTrainingCommandForStep:self.trainingGuideStep]];
+        [self refreshTrainingWindow:nil];
+        return;
+    }
+
+    self.trainingGuideRunning = NO;
+    self.trainingGuideStep = -1;
+    [self.trainingGuideTimer invalidate];
+    self.trainingGuideTimer = nil;
+    [self sendCommand:@"record_stop"];
     [self sendCommand:@"train_ai"];
     [self refreshTrainingWindowSoon];
 }
@@ -631,6 +745,10 @@
     [content addSubview:self.trainingPoolLabel];
     [content addSubview:self.trainingRecordingLabel];
 
+    self.trainingCoachLabel = [self makeTrainingInfoLabel:@"" frame:NSMakeRect(36, 474, 824, 36)];
+    self.trainingCoachLabel.maximumNumberOfLines = 2;
+    [content addSubview:self.trainingCoachLabel];
+
     self.trainingReadLabel = [self makeTrainingLabel:@"READ 0/300" y:452];
     self.trainingReadGuideLabel = [self makeTrainingGuideLabel:@"" y:426];
     self.trainingReadProgress = [self makeTrainingProgressAtY:404];
@@ -677,13 +795,15 @@
     self.trainingStatusLabel.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     [content addSubview:self.trainingStatusLabel];
 
-    self.trainingStopButton = [self makeTrainingButton:@"Stop Recording" frame:NSMakeRect(38, 26, 156, 42) action:@selector(stopRecordingSamples:)];
-    self.trainingResetButton = [self makeTrainingButton:@"Reset Samples" frame:NSMakeRect(212, 26, 156, 42) action:@selector(resetTrainingSamples:)];
-    self.trainingFolderButton = [self makeTrainingButton:@"Data Folder" frame:NSMakeRect(386, 26, 156, 42) action:@selector(openTrainingDataFolder:)];
+    self.trainingStopButton = [self makeTrainingButton:@"Stop" frame:NSMakeRect(38, 26, 118, 42) action:@selector(stopRecordingSamples:)];
+    self.trainingResetButton = [self makeTrainingButton:@"Reset" frame:NSMakeRect(170, 26, 124, 42) action:@selector(resetTrainingSamples:)];
+    self.trainingFolderButton = [self makeTrainingButton:@"Folder" frame:NSMakeRect(308, 26, 124, 42) action:@selector(openTrainingDataFolder:)];
+    self.trainingGuideButton = [self makeTrainingButton:@"Auto Session" frame:NSMakeRect(446, 26, 160, 42) action:@selector(startGuidedTraining:)];
     self.trainingTrainButton = [self makeTrainingButton:@"Train Model" frame:NSMakeRect(676, 26, 184, 42) action:@selector(trainPersonalAI:)];
     [content addSubview:self.trainingStopButton];
     [content addSubview:self.trainingResetButton];
     [content addSubview:self.trainingFolderButton];
+    [content addSubview:self.trainingGuideButton];
     [content addSubview:self.trainingTrainButton];
     [self applyTrainingWindowStyle];
 }
@@ -756,10 +876,12 @@
     self.trainingPoolLabel.font = [self uiFontOfSize:12 weight:NSFontWeightSemibold];
     self.trainingRecordingLabel.font = [self uiFontOfSize:12 weight:NSFontWeightSemibold];
     self.trainingNextLabel.font = [self uiFontOfSize:13 weight:NSFontWeightSemibold];
+    self.trainingCoachLabel.font = [self uiFontOfSize:14 weight:NSFontWeightSemibold];
     self.trainingQualityLabel.textColor = [self primaryTextColor];
     self.trainingPoolLabel.textColor = [self primaryTextColor];
     self.trainingRecordingLabel.textColor = [self primaryTextColor];
     self.trainingNextLabel.textColor = [self primaryTextColor];
+    self.trainingCoachLabel.textColor = [self accentColor];
     self.trainingReadLabel.font = [self uiFontOfSize:17 weight:NSFontWeightSemibold];
     self.trainingLiveLabel.font = [self uiFontOfSize:17 weight:NSFontWeightSemibold];
     self.trainingLookLabel.font = [self uiFontOfSize:17 weight:NSFontWeightSemibold];
@@ -778,9 +900,10 @@
     self.trainingNeedLabel.font = [self uiFontOfSize:13 weight:NSFontWeightRegular];
     self.trainingStatusLabel.font = [self uiFontOfSize:14 weight:NSFontWeightSemibold];
     self.trainingStatusLabel.textColor = [self accentColor];
-    [self styleButton:self.trainingStopButton title:[self textEN:@"Stop Recording" ru:@"Стоп"] emphasized:NO];
-    [self styleButton:self.trainingResetButton title:[self textEN:@"Reset Samples" ru:@"Обнулить"] emphasized:NO];
+    [self styleButton:self.trainingStopButton title:[self textEN:@"Stop" ru:@"Стоп"] emphasized:NO];
+    [self styleButton:self.trainingResetButton title:[self textEN:@"Reset" ru:@"Обнулить"] emphasized:NO];
     [self styleButton:self.trainingFolderButton title:[self textEN:@"Data Folder" ru:@"Папка данных"] emphasized:NO];
+    [self styleButton:self.trainingGuideButton title:(self.trainingGuideRunning ? [self textEN:@"Stop Auto" ru:@"Стоп авто"] : [self textEN:@"Auto Session" ru:@"Авто-сессия"]) emphasized:self.trainingGuideRunning];
     [self styleButton:self.trainingTrainButton title:[self textEN:@"Train Model" ru:@"Обучить"] emphasized:YES];
 }
 
@@ -830,6 +953,8 @@
     double modelThreshold = [state[@"model_threshold"] doubleValue];
     NSInteger historyFiles = [state[@"history_files"] integerValue];
     double warmupSeconds = [state[@"recording_warmup_seconds"] doubleValue];
+    double warmupRemaining = [state[@"recording_warmup_remaining_seconds"] doubleValue];
+    double cleanSeconds = [state[@"recording_clean_seconds"] doubleValue];
 
     self.trainingReadLabel.stringValue = [NSString stringWithFormat:@"%@  %ld / %ld", [self textEN:@"READ now" ru:@"ЧТЕНИЕ сейчас"], (long)read, (long)target];
     self.trainingLiveLabel.stringValue = [NSString stringWithFormat:@"%@  %ld / %ld", [self textEN:@"LIVE now" ru:@"ЖИВОЙ сейчас"], (long)live, (long)target];
@@ -858,10 +983,34 @@
     }
     if ([self isRussian]) {
         self.trainingPoolLabel.stringValue = [NSString stringWithFormat:@"Сохранённая база\n%ld всего • %ld сессий", (long)poolTotal, (long)historyFiles];
-        self.trainingRecordingLabel.stringValue = [NSString stringWithFormat:@"Запись\n%@ • старт %.1fс не берём", recordingTitle, warmupSeconds > 0.0 ? warmupSeconds : 0.6];
+        self.trainingRecordingLabel.stringValue = [NSString stringWithFormat:@"Запись\n%@ • подготовка %.0fс", recordingTitle, warmupSeconds > 0.0 ? warmupSeconds : 3.0];
     } else {
         self.trainingPoolLabel.stringValue = [NSString stringWithFormat:@"Saved dataset\n%ld total • %ld sessions", (long)poolTotal, (long)historyFiles];
-        self.trainingRecordingLabel.stringValue = [NSString stringWithFormat:@"Recording\n%@ • %.1fs warmup skipped", recordingTitle, warmupSeconds > 0.0 ? warmupSeconds : 0.6];
+        self.trainingRecordingLabel.stringValue = [NSString stringWithFormat:@"Recording\n%@ • %.0fs prepare", recordingTitle, warmupSeconds > 0.0 ? warmupSeconds : 3.0];
+    }
+
+    if (self.trainingGuideRunning) {
+        NSTimeInterval now = [[NSDate date] timeIntervalSinceReferenceDate];
+        NSTimeInterval stepElapsed = MAX(0.0, now - self.trainingGuideStepStartedAt);
+        NSTimeInterval stepDuration = [self guidedTrainingDurationForStep:self.trainingGuideStep];
+        NSInteger secondsLeft = (NSInteger)ceil(MAX(0.0, stepDuration - stepElapsed));
+        NSString *stage = [self guidedTrainingTitleForStep:self.trainingGuideStep];
+        NSString *instruction = [self guidedTrainingInstructionForStep:self.trainingGuideStep];
+        if (warmupRemaining > 0.05) {
+            self.trainingCoachLabel.stringValue = [NSString stringWithFormat:@"%@: %@ %.0f…\n%@", [self textEN:@"Get ready" ru:@"Подготовка"], stage, ceil(warmupRemaining), instruction];
+        } else {
+            self.trainingCoachLabel.stringValue = [NSString stringWithFormat:@"%@: %@ • %@ %lds\n%@", [self textEN:@"Recording" ru:@"Идёт запись"], stage, [self textEN:@"left" ru:@"осталось"], (long)secondsLeft, instruction];
+        }
+        self.trainingCoachLabel.textColor = [self accentColor];
+    } else if (recording.length > 0 && warmupRemaining > 0.05) {
+        self.trainingCoachLabel.stringValue = [NSString stringWithFormat:@"%@ %.0f…\n%@", [self textEN:@"Prepare, samples start in" ru:@"Настройся, запись начнётся через"], ceil(warmupRemaining), [self textEN:@"Hold the needed state now. These first seconds are not saved." ru:@"Уже держи нужное состояние. Эти первые секунды не сохраняются."]];
+        self.trainingCoachLabel.textColor = [self accentColor];
+    } else if (recording.length > 0) {
+        self.trainingCoachLabel.stringValue = [NSString stringWithFormat:@"%@ %.0fs\n%@", [self textEN:@"Clean recording" ru:@"Чистая запись"], cleanSeconds, [self textEN:@"Press Stop before switching to another state." ru:@"Перед сменой режима нажми Стоп."]];
+        self.trainingCoachLabel.textColor = [self accentColor];
+    } else {
+        self.trainingCoachLabel.stringValue = [self textEN:@"Use Auto Session for a guided READ → LIVE → LOOK pass with a 3-second prepare pause before each part." ru:@"Нажми Авто-сессия: приложение проведёт ЧТЕНИЕ → ЖИВОЙ → ВЗГЛЯД с паузой 3 секунды перед каждым этапом."];
+        self.trainingCoachLabel.textColor = [self secondaryTextColor];
     }
 
     if (needRead == 0 && needNonRead == 0) {
@@ -920,6 +1069,7 @@
     [self styleButton:self.trainingReadButton title:([recording isEqualToString:@"read"] ? [self textEN:@"Recording READ" ru:@"Пишу ЧТЕНИЕ"] : [self textEN:@"Record READ" ru:@"Писать ЧТЕНИЕ"]) emphasized:[recording isEqualToString:@"read"]];
     [self styleButton:self.trainingLiveButton title:([recording isEqualToString:@"live"] ? [self textEN:@"Recording LIVE" ru:@"Пишу ЖИВОЙ"] : [self textEN:@"Record LIVE" ru:@"Писать ЖИВОЙ"]) emphasized:[recording isEqualToString:@"live"]];
     [self styleButton:self.trainingLookButton title:([recording isEqualToString:@"glance"] ? [self textEN:@"Recording LOOK" ru:@"Пишу ВЗГЛЯД"] : [self textEN:@"Record LOOK" ru:@"Писать ВЗГЛЯД"]) emphasized:[recording isEqualToString:@"glance"]];
+    [self styleButton:self.trainingGuideButton title:(self.trainingGuideRunning ? [self textEN:@"Stop Auto" ru:@"Стоп авто"] : [self textEN:@"Auto Session" ru:@"Авто-сессия"]) emphasized:self.trainingGuideRunning];
     [self styleButton:self.trainingTrainButton title:(canTrain ? [self textEN:@"Train Model" ru:@"Обучить"] : [self textEN:@"Train Anyway" ru:@"Пробовать обучить"]) emphasized:YES];
 }
 
@@ -1282,6 +1432,7 @@
     if (notification.object == self.trainingWindow) {
         [self.trainingRefreshTimer invalidate];
         self.trainingRefreshTimer = nil;
+        [self cancelGuidedTraining:YES];
     }
 }
 
