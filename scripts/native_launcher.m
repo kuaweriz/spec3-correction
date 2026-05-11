@@ -413,55 +413,25 @@
                               mediaType:AVMediaTypeVideo
                                position:AVCaptureDevicePositionUnspecified];
     NSArray<AVCaptureDevice *> *devices = session.devices;
-    NSMutableArray *rawItems = [NSMutableArray arrayWithCapacity:devices.count];
-    BOOL hasPhysicalCamera = NO;
+    NSMutableArray *items = [NSMutableArray arrayWithCapacity:devices.count];
     NSInteger index = 0;
     for (AVCaptureDevice *device in devices) {
         NSString *name = device.localizedName ?: [NSString stringWithFormat:@"Camera %ld", (long)index];
         NSString *uniqueID = device.uniqueID ?: @"";
         NSString *modelID = device.modelID ?: @"";
-        BOOL isVirtual = [self isVirtualCameraName:name modelID:modelID uniqueID:uniqueID];
-        if (!isVirtual) {
-            hasPhysicalCamera = YES;
-        }
-        [rawItems addObject:@{
+        [items addObject:@{
             @"id": @(index),
             @"name": name,
             @"unique_id": uniqueID,
             @"model_id": modelID,
-            @"is_virtual": @(isVirtual),
         }];
         index += 1;
-    }
-
-    NSMutableArray *items = [NSMutableArray arrayWithCapacity:rawItems.count];
-    for (NSDictionary *item in rawItems) {
-        if (hasPhysicalCamera && [item[@"is_virtual"] boolValue]) {
-            continue;
-        }
-        NSMutableDictionary *cleanItem = [item mutableCopy];
-        [cleanItem removeObjectForKey:@"is_virtual"];
-        [items addObject:cleanItem];
     }
 
     NSData *data = [NSJSONSerialization dataWithJSONObject:items options:NSJSONWritingPrettyPrinted error:nil];
     if (data) {
         [data writeToFile:self.cameraListPath atomically:YES];
     }
-}
-
-- (BOOL)isVirtualCameraName:(NSString *)name modelID:(NSString *)modelID uniqueID:(NSString *)uniqueID {
-    NSString *combined = [[NSString stringWithFormat:@"%@ %@ %@",
-                           name ?: @"",
-                           modelID ?: @"",
-                           uniqueID ?: @""] lowercaseString];
-    NSArray<NSString *> *tokens = @[@"virtual", @"gazeat", @"casablanca", @"obs", @"sample", @"snap"];
-    for (NSString *token in tokens) {
-        if ([combined containsString:token]) {
-            return YES;
-        }
-    }
-    return NO;
 }
 
 - (void)startCamera:(id)sender {
