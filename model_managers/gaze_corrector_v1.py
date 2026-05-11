@@ -375,6 +375,43 @@ class EyeOutputHoldFilter:
         return output
 
 
+class IrisRetargetTemporalFilter:
+    """Smooths physically retargeted iris centers without adding cursor-like lag."""
+
+    def __init__(self):
+        self.previous: dict[str, np.ndarray] = {}
+
+    def reset(self) -> None:
+        self.previous.clear()
+
+    def reset_eye(self, eye_side: str) -> None:
+        self.previous.pop(eye_side, None)
+
+    def apply(
+        self,
+        eye_side: str,
+        target: tuple[float, float],
+        frame_size: tuple[int, int],
+        strength: float,
+    ) -> tuple[float, float]:
+        current = np.asarray(target, dtype=np.float32)
+        previous = self.previous.get(eye_side)
+        if previous is None:
+            self.previous[eye_side] = current
+            return float(current[0]), float(current[1])
+
+        h, w = frame_size
+        jump = float(np.linalg.norm(current - previous))
+        jump_scale = max(1.0, min(h, w) * 0.22)
+        catch_up = np.clip(jump / jump_scale, 0.0, 1.0)
+        base_alpha = 0.62 - 0.26 * np.clip(strength, 0.0, 1.0)
+        alpha = float(np.clip(base_alpha + catch_up * 0.28, 0.30, 0.86))
+
+        smoothed = previous * (1.0 - alpha) + current * alpha
+        self.previous[eye_side] = smoothed
+        return float(smoothed[0]), float(smoothed[1])
+
+
 class ReadingActivityDetector:
     """Classifies reading from short-term iris motion patterns."""
 
@@ -1062,6 +1099,7 @@ class GazeCorrector:
         self.gaze_filter = OneEuroVectorFilter(self.stabilization_cfg)
         self.pupil_hold_filter = PupilHoldFilter()
         self.eye_output_hold_filter = EyeOutputHoldFilter()
+        self.iris_retarget_filter = IrisRetargetTemporalFilter()
         self.personal_reading = PersonalReadingLearner(logger=self.logger)
         self.reading_detector = ReadingActivityDetector(self.personal_reading)
         self._apply_tuning_to_filter()
@@ -1216,6 +1254,7 @@ class GazeCorrector:
         self.gaze_filter.reset()
         self.pupil_hold_filter.reset()
         self.eye_output_hold_filter.reset()
+        self.iris_retarget_filter.reset()
         self.reading_detector.reset()
         self.last_reading_active = False
         self.last_reading_score = 0.0
@@ -1602,6 +1641,13 @@ class GazeCorrector:
             stabilizer,
         )
 
+    @staticmethod
+    def _smoothstep(edge0: float, edge1: float, value: float) -> float:
+        if edge0 == edge1:
+            return 1.0 if value >= edge1 else 0.0
+        t = float(np.clip((value - edge0) / (edge1 - edge0), 0.0, 1.0))
+        return t * t * (3.0 - 2.0 * t)
+
     def _eye_is_closed(self, eye_data) -> bool:
         """Detect blink/closed eye; DeepWarp must not draw an open pupil then."""
         return float(getattr(eye_data, "openness", 1.0)) < 0.215
@@ -1635,6 +1681,7 @@ class GazeCorrector:
     def _reset_eye_temporal_state(self, eye_side: str) -> None:
         self.pupil_hold_filter.reset_eye(eye_side)
         self.eye_output_hold_filter.reset_eye(eye_side)
+        self.iris_retarget_filter.reset_eye(eye_side)
 
     def _shift_corrected_eye(
         self, image: np.ndarray, delta: np.ndarray, stabilizer: float
@@ -1690,9 +1737,9 @@ class GazeCorrector:
         if angle is None:
             return 0.0
         vertical = float(angle[0])
-        if vertical >= -18.0:
+        if vertical >= -16.0:
             return 0.0
-        return float(np.clip((-vertical - 18.0) / 28.0, 0.0, 1.0))
+        return self._smoothstep(0.0, 1.0, (-vertical - 16.0) / 30.0)
 
     def correct_eye(
         self,
@@ -1713,7 +1760,7 @@ class GazeCorrector:
         Returns:
             Corrected eye image resized to original size
         """
-        if self._downward_retarget_intensity(angle) >= 0.34:
+        if self._downward_retarget_intensity(angle) >= 0.24:
             return cv2.resize(
                 eye_data.image,
                 (eye_data.original_size[1], eye_data.original_size[0]),
@@ -1943,7 +1990,7 @@ class GazeCorrector:
         if binary.max() == 0:
             return np.zeros(aperture.shape, dtype=np.float32)
 
-        erode_px = max(1, int(min(h, w) * (0.020 + 0.040 * intensity)))
+        erode_px = max(1, int(min(h, w) * (0.026 + 0.052 * intensity)))
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1)
         )
@@ -1952,7 +1999,7 @@ class GazeCorrector:
             inner = binary
 
         distance = cv2.distanceTransform(inner, cv2.DIST_L2, 3)
-        feather = max(1.0, min(h, w) * (0.030 + 0.018 * intensity))
+        feather = max(1.0, min(h, w) * (0.026 + 0.020 * intensity))
         visible = np.clip(distance / feather, 0.0, 1.0)
         visible = np.minimum(visible, aperture)
         blur = max(3, int(min(h, w) * 0.030) | 1)
@@ -1960,13 +2007,14 @@ class GazeCorrector:
 
     def _retarget_downward_iris(
         self,
+        eye_side: str,
         original: np.ndarray,
         aperture: np.ndarray,
         work_mask: np.ndarray,
         source_hint: np.ndarray,
         angle: list[float] | None,
     ) -> tuple[np.ndarray, np.ndarray, float]:
-        """Fallback for strong downward gaze where the GAN creates a pasted iris."""
+        """Move the user's real iris texture when DeepWarp would create a pasted iris."""
         intensity = self._downward_retarget_intensity(angle)
         if intensity <= 0.0 or original.size == 0:
             return original, np.zeros(aperture.shape, dtype=np.float32), 0.0
@@ -2024,12 +2072,19 @@ class GazeCorrector:
         iris_h = max(2.0, float(np.max(iris_rows) - np.min(iris_rows) + 1)) if len(iris_rows) else h * 0.24
         iris_w = max(2.0, float(np.max(iris_cols) - np.min(iris_cols) + 1)) if len(iris_cols) else w * 0.18
 
-        target_x = w * (0.50 + np.clip(horizontal_angle / 42.0, -1.0, 1.0) * 0.14)
-        target_x = float(np.clip(target_x, w * 0.30 + iris_w * 0.18, w * 0.70 - iris_w * 0.18))
-        target_y = aperture_top + aperture_h * (0.56 + 0.18 * intensity)
-        target_y = float(np.clip(target_y, aperture_top + iris_h * 0.22, aperture_bottom - iris_h * 0.18))
-        shift_x = float(np.clip(target_x - cx, -w * 0.18, w * 0.18))
-        shift_y = float(np.clip(target_y - cy, -h * 0.03, h * (0.13 + 0.07 * intensity)))
+        horizontal_target = 0.50 + np.clip(horizontal_angle / 42.0, -1.0, 1.0) * 0.16
+        target_x = w * horizontal_target
+        target_x = float(np.clip(target_x, w * 0.28 + iris_w * 0.22, w * 0.72 - iris_w * 0.22))
+        target_y = aperture_top + aperture_h * (0.55 + 0.23 * intensity)
+        target_y = float(np.clip(target_y, aperture_top + iris_h * 0.28, aperture_bottom - iris_h * 0.10))
+        target_x, target_y = self.iris_retarget_filter.apply(
+            eye_side,
+            (target_x, target_y),
+            (h, w),
+            intensity,
+        )
+        shift_x = float(np.clip(target_x - cx, -w * 0.22, w * 0.22))
+        shift_y = float(np.clip(target_y - cy, -h * 0.04, h * (0.16 + 0.12 * intensity)))
 
         matrix = np.asarray([[1.0, 0.0, shift_x], [0.0, 1.0, shift_y]], dtype=np.float32)
         shifted_eye = cv2.warpAffine(
@@ -2051,15 +2106,15 @@ class GazeCorrector:
         shifted_mask = np.clip(shifted_mask * visibility, 0.0, 1.0)
 
         cleanup = np.maximum(source_iris, np.clip(source_hint, 0.0, 1.0) * aperture)
-        cleanup = (cleanup > 0.045).astype(np.uint8)
+        cleanup = (cleanup > 0.030).astype(np.uint8)
         cleanup_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (
-                max(3, int(w * (0.080 + 0.035 * intensity)) | 1),
-                max(3, int(h * (0.155 + 0.075 * intensity)) | 1),
+                max(3, int(w * (0.095 + 0.050 * intensity)) | 1),
+                max(3, int(h * (0.175 + 0.090 * intensity)) | 1),
             ),
         )
-        cleanup = cv2.dilate(cleanup, cleanup_kernel, iterations=3)
+        cleanup = cv2.dilate(cleanup, cleanup_kernel, iterations=2)
         cleanup = np.clip(cleanup.astype(np.float32) * aperture, 0.0, 1.0)
 
         inpaint_mask = (cleanup > 0.08).astype(np.uint8) * 255
@@ -2073,8 +2128,9 @@ class GazeCorrector:
         cleanup_soft = np.clip(cv2.GaussianBlur(cleanup, (5, 5), 0), 0.0, 1.0)
         retargeted = shifted_eye * shifted_mask[:, :, None] + cleaned * (1.0 - shifted_mask[:, :, None])
 
-        alpha_boost = np.maximum(cleanup_soft * 0.98, shifted_mask * 0.99) * intensity
-        output = retargeted * intensity + original * (1.0 - intensity)
+        retarget_mix = self._smoothstep(0.04, 0.34, intensity)
+        alpha_boost = np.maximum(cleanup_soft * 0.99, shifted_mask * 0.99) * max(0.35, retarget_mix)
+        output = retargeted * retarget_mix + original * (1.0 - retarget_mix)
         return np.clip(output, 0.0, 1.0), np.clip(alpha_boost, 0.0, 0.98), intensity
 
     def _sharpen_corrected_eye(self, image: np.ndarray) -> np.ndarray:
@@ -2169,6 +2225,7 @@ class GazeCorrector:
         self,
         frame: np.ndarray,
         eye_data,
+        eye_side: str,
         corrected_eye: np.ndarray,
         hold_strength: float = 0.0,
         correction_alpha: float = 1.0,
@@ -2215,6 +2272,7 @@ class GazeCorrector:
             scale=1.18,
         )[src_top:src_bottom, src_left:src_right]
         retargeted_crop, retarget_alpha, retarget_strength = self._retarget_downward_iris(
+            eye_side,
             original,
             aperture_crop,
             work_crop,
@@ -2222,14 +2280,15 @@ class GazeCorrector:
             correction_angle,
         )
         if retarget_strength > 0.0:
-            if retarget_strength >= 0.34:
+            if retarget_strength >= 0.22:
                 corrected_crop = retargeted_crop
             else:
+                partial = self._smoothstep(0.0, 0.22, retarget_strength)
                 corrected_crop = (
-                    corrected_crop * (1.0 - retarget_strength)
-                    + retargeted_crop * retarget_strength
+                    corrected_crop * (1.0 - partial)
+                    + retargeted_crop * partial
                 )
-            alpha = alpha * max(0.0, 1.0 - 1.10 * retarget_strength)
+            alpha = alpha * max(0.0, 1.0 - 1.35 * retarget_strength)
             alpha = np.maximum(alpha, retarget_alpha[:, :, None])
 
         corrected_iris = self._iris_detail_mask(corrected_crop, aperture_crop, work_crop)
@@ -2242,9 +2301,10 @@ class GazeCorrector:
             hold_strength,
         )
         corrected_iris = self._iris_detail_mask(corrected_crop, aperture_crop, work_crop)
-        if retarget_strength >= 0.34:
+        if retarget_strength >= 0.18:
             # In strong downward gaze the old iris must be removed, not blended back in.
-            iris_replace = corrected_iris * (0.78 - 0.28 * retarget_strength)
+            retarget_weight = 0.90 - 0.12 * np.clip(retarget_strength, 0.0, 1.0)
+            iris_replace = np.maximum(retarget_alpha, corrected_iris * retarget_weight)
         else:
             iris_replace = np.maximum(corrected_iris * 0.98, original_iris * 0.92)
         iris_replace = np.clip(iris_replace * np.clip(correction_alpha, 0.0, 1.0), 0.0, 0.98)
@@ -2344,6 +2404,7 @@ class GazeCorrector:
                 self._blend_eye_region(
                     frame,
                     le,
+                    "L",
                     le_corrected,
                     le_hold,
                     le_blend,
@@ -2362,6 +2423,7 @@ class GazeCorrector:
                 self._blend_eye_region(
                     frame,
                     re,
+                    "R",
                     re_corrected,
                     re_hold,
                     re_blend,
