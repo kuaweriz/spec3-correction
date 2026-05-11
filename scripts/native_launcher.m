@@ -380,12 +380,19 @@
 - (BOOL)cameraPermissionAllowed {
     AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
     if (status == AVAuthorizationStatusNotDetermined) {
-        dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+        [self logLine:@"Requesting camera access"];
         [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
-            dispatch_semaphore_signal(sema);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (granted) {
+                    [self startCamera:nil];
+                } else {
+                    [self showAlert:@"Camera access is blocked"
+                            message:@"Open System Settings > Privacy & Security > Camera and allow spec3 correction, then open it again from the menu bar icon."];
+                    [self enterMenuBarMode];
+                }
+            });
         }];
-        dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
-        status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
+        return NO;
     }
 
     if (status != AVAuthorizationStatusAuthorized) {
@@ -406,25 +413,55 @@
                               mediaType:AVMediaTypeVideo
                                position:AVCaptureDevicePositionUnspecified];
     NSArray<AVCaptureDevice *> *devices = session.devices;
-    NSMutableArray *items = [NSMutableArray arrayWithCapacity:devices.count];
+    NSMutableArray *rawItems = [NSMutableArray arrayWithCapacity:devices.count];
+    BOOL hasPhysicalCamera = NO;
     NSInteger index = 0;
     for (AVCaptureDevice *device in devices) {
         NSString *name = device.localizedName ?: [NSString stringWithFormat:@"Camera %ld", (long)index];
         NSString *uniqueID = device.uniqueID ?: @"";
         NSString *modelID = device.modelID ?: @"";
-        [items addObject:@{
+        BOOL isVirtual = [self isVirtualCameraName:name modelID:modelID uniqueID:uniqueID];
+        if (!isVirtual) {
+            hasPhysicalCamera = YES;
+        }
+        [rawItems addObject:@{
             @"id": @(index),
             @"name": name,
             @"unique_id": uniqueID,
             @"model_id": modelID,
+            @"is_virtual": @(isVirtual),
         }];
         index += 1;
+    }
+
+    NSMutableArray *items = [NSMutableArray arrayWithCapacity:rawItems.count];
+    for (NSDictionary *item in rawItems) {
+        if (hasPhysicalCamera && [item[@"is_virtual"] boolValue]) {
+            continue;
+        }
+        NSMutableDictionary *cleanItem = [item mutableCopy];
+        [cleanItem removeObjectForKey:@"is_virtual"];
+        [items addObject:cleanItem];
     }
 
     NSData *data = [NSJSONSerialization dataWithJSONObject:items options:NSJSONWritingPrettyPrinted error:nil];
     if (data) {
         [data writeToFile:self.cameraListPath atomically:YES];
     }
+}
+
+- (BOOL)isVirtualCameraName:(NSString *)name modelID:(NSString *)modelID uniqueID:(NSString *)uniqueID {
+    NSString *combined = [[NSString stringWithFormat:@"%@ %@ %@",
+                           name ?: @"",
+                           modelID ?: @"",
+                           uniqueID ?: @""] lowercaseString];
+    NSArray<NSString *> *tokens = @[@"virtual", @"gazeat", @"casablanca", @"obs", @"sample", @"snap"];
+    for (NSString *token in tokens) {
+        if ([combined containsString:token]) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 - (void)startCamera:(id)sender {
@@ -435,11 +472,11 @@
         return;
     }
 
+    [self writeCameraList];
     if (![self cameraPermissionAllowed]) {
         [self enterMenuBarMode];
         return;
     }
-    [self writeCameraList];
 
     [[NSFileManager defaultManager] removeItemAtPath:self.controlPath error:nil];
     self.stopRequested = NO;

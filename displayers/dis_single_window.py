@@ -37,6 +37,7 @@ from utils.camera_selection import (
     is_virtual_camera_name,
     list_macos_cameras,
     load_saved_camera_name,
+    physical_camera_options,
     save_camera_id,
 )
 from displayers.face_predictor import (
@@ -301,7 +302,10 @@ class SingleWindowGazeCorrector:
         self._pending_camera_label = ""
         self.camera_dropdown_open = False
         self.camera_options: list[CameraInfo] = []
+        self._all_camera_options: list[CameraInfo] = []
         saved_camera_label = load_saved_camera_name()
+        if saved_camera_label and is_virtual_camera_name(saved_camera_label):
+            saved_camera_label = ""
         self.camera_label = saved_camera_label or f"Camera {self.camera_id}"
         self._camera_label_overrides: dict[int, str] = {}
         if saved_camera_label:
@@ -385,13 +389,25 @@ class SingleWindowGazeCorrector:
         with self._camera_refresh_lock:
             active_id = self._pending_camera_id if self._pending_camera_id is not None else self.camera_id
             if cameras:
+                self._all_camera_options = list(cameras)
                 self.camera_options = self._camera_options_for_display(cameras, active_id)
             elif not self.camera_options:
                 self.camera_options = [CameraInfo(self.camera_id, f"Camera {self.camera_id}")]
 
-            if all(camera.id != active_id for camera in self.camera_options):
+            active_name = camera_name(active_id, cameras) if cameras else f"Camera {active_id}"
+            has_physical = any(not is_virtual_camera_name(camera.name) for camera in cameras)
+            active_is_hidden_virtual = has_physical and is_virtual_camera_name(active_name)
+            if all(camera.id != active_id for camera in self.camera_options) and not active_is_hidden_virtual:
                 self.camera_options.append(CameraInfo(active_id, f"Camera {active_id}"))
                 self.camera_options = self._deduplicate_camera_options(self.camera_options, active_id)
+
+            if active_is_hidden_virtual and self.camera_options:
+                physical = self.camera_options[0]
+                if self._pending_camera_id is None:
+                    self._pending_camera_id = physical.id
+                    self._pending_camera_label = physical.name
+                    self._camera_switching = True
+                active_id = physical.id
 
             self.camera_label = self._camera_label_overrides.get(
                 active_id,
@@ -422,6 +438,7 @@ class SingleWindowGazeCorrector:
         cameras: list[CameraInfo],
         active_id: int,
     ) -> list[CameraInfo]:
+        cameras = physical_camera_options(cameras)
         options = [
             CameraInfo(camera.id, self._camera_label_overrides.get(camera.id, camera.name))
             for camera in cameras
@@ -1693,7 +1710,7 @@ class SingleWindowGazeCorrector:
     def _camera_candidate_ids(self, preferred_id: int, requested_label: str) -> list[int]:
         candidates: list[int] = []
         with self._camera_refresh_lock:
-            camera_options = list(self.camera_options)
+            camera_options = list(self._all_camera_options or self.camera_options)
         virtual_ids = {
             camera.id for camera in camera_options if is_virtual_camera_name(camera.name)
         }
@@ -1722,8 +1739,12 @@ class SingleWindowGazeCorrector:
             add(camera.id)
 
         # OpenCV can expose AVFoundation devices in a different order from the
-        # native device list, so keep a small slot probe as the final fallback.
-        for camera_id in range(6):
+        # native device list. Probe only known slots when macOS gave us a list,
+        # otherwise keep a small blind fallback for unusual systems.
+        probe_limit = max((camera.id for camera in camera_options), default=5) + 1
+        if not camera_options:
+            probe_limit = 6
+        for camera_id in range(probe_limit):
             add(camera_id)
 
         return candidates
@@ -1803,7 +1824,7 @@ class SingleWindowGazeCorrector:
         for candidate_id in candidates:
             candidate_label = self._camera_label_overrides.get(
                 candidate_id,
-                camera_name(candidate_id, self.camera_options),
+                camera_name(candidate_id, self._all_camera_options or self.camera_options),
             )
             if label and not is_virtual_camera_name(label) and is_virtual_camera_name(candidate_label):
                 self.logger.log(
@@ -1823,7 +1844,7 @@ class SingleWindowGazeCorrector:
 
         preferred_label = self._camera_label_overrides.get(
             preferred_id,
-            camera_name(preferred_id, self.camera_options),
+            camera_name(preferred_id, self._all_camera_options or self.camera_options),
         )
         if label and not is_virtual_camera_name(label) and is_virtual_camera_name(preferred_label):
             self.logger.log(
@@ -1872,7 +1893,7 @@ class SingleWindowGazeCorrector:
             self.logger.log(f"Could not switch to camera {next_camera_id}")
             self.camera_label = self._camera_label_overrides.get(
                 self.camera_id,
-                camera_name(self.camera_id, self.camera_options),
+                camera_name(self.camera_id, self._all_camera_options or self.camera_options),
             )
             self._camera_switching = False
             self._set_camera_status("Camera did not respond", 3.0)
@@ -1881,7 +1902,10 @@ class SingleWindowGazeCorrector:
 
         stream.release()
         self.camera_id = actual_camera_id
-        self.camera_label = requested_label or camera_name(self.camera_id, self.camera_options)
+        self.camera_label = requested_label or camera_name(
+            self.camera_id,
+            self._all_camera_options or self.camera_options,
+        )
         self._remember_camera_label(self.camera_id, self.camera_label)
         if not is_virtual_camera_name(self.camera_label):
             save_camera_id(self.camera_id, self.camera_label)
@@ -1892,11 +1916,11 @@ class SingleWindowGazeCorrector:
         return CameraFrameStream(next_cap, self.logger)
 
     def _recover_camera_stream(self, stream: CameraFrameStream, reason: str):
-        """Try another live slot instead of closing the app when a saved camera stalls."""
+        """Try the physical stream again instead of falling into virtual camera slots."""
         self.logger.log(f"{reason}; looking for another live camera slot")
         stream.release()
         with self._camera_refresh_lock:
-            camera_options = list(self.camera_options)
+            camera_options = list(self._all_camera_options or self.camera_options)
 
         prefer_physical = not is_virtual_camera_name(self.camera_label)
         candidates = self._camera_candidate_ids(self.camera_id, self.camera_label)
@@ -1912,7 +1936,7 @@ class SingleWindowGazeCorrector:
         for candidate_id in candidates:
             recovered_label = self._camera_label_overrides.get(
                 candidate_id,
-                camera_name(candidate_id, self.camera_options),
+                camera_name(candidate_id, self._all_camera_options or self.camera_options),
             )
             if prefer_physical and is_virtual_camera_name(recovered_label):
                 self.logger.log(

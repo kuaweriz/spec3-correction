@@ -162,11 +162,22 @@ def list_macos_cameras(force_refresh: bool = False) -> list[CameraInfo]:
     ):
         return list(_camera_cache)
 
-    cameras = (
-        _list_cameras_from_avfoundation_file()
-        or _list_cameras_from_json_profiler()
-        or _list_cameras_from_text_profiler()
-    )
+    avfoundation_cameras = _list_cameras_from_avfoundation_file()
+    profiler_cameras = _list_cameras_from_json_profiler() or _list_cameras_from_text_profiler()
+    if avfoundation_cameras:
+        avfoundation_has_physical = any(
+            not is_virtual_camera_name(camera.name) for camera in avfoundation_cameras
+        )
+        profiler_has_physical = any(
+            not is_virtual_camera_name(camera.name) for camera in profiler_cameras
+        )
+        cameras = (
+            avfoundation_cameras
+            if avfoundation_has_physical or not profiler_has_physical
+            else profiler_cameras
+        )
+    else:
+        cameras = profiler_cameras
     _camera_cache = cameras
     _camera_cache_time = now
     return list(cameras)
@@ -183,6 +194,12 @@ def camera_name(camera_id: int, cameras: list[CameraInfo] | None = None) -> str:
 def is_virtual_camera_name(name: str) -> bool:
     lower = name.lower()
     return any(token in lower for token in VIRTUAL_CAMERA_TOKENS)
+
+
+def physical_camera_options(cameras: list[CameraInfo]) -> list[CameraInfo]:
+    """Hide virtual feedback cameras when at least one real camera is available."""
+    physical = [camera for camera in cameras if not is_virtual_camera_name(camera.name)]
+    return physical or list(cameras)
 
 
 def choose_camera_id(requested_camera_id: int) -> int:
@@ -203,6 +220,7 @@ def choose_camera_id(requested_camera_id: int) -> int:
     saved_camera_id = load_saved_camera_id()
     saved_camera_name = load_saved_camera_name()
     saved_camera = next((camera for camera in cameras if camera.id == saved_camera_id), None)
+    visible_cameras = physical_camera_options(cameras)
 
     if saved_camera_name and not is_virtual_camera_name(saved_camera_name):
         if saved_camera is not None and _camera_names_match(saved_camera.name, saved_camera_name):
@@ -226,6 +244,9 @@ def choose_camera_id(requested_camera_id: int) -> int:
             )
             return saved_camera.id
 
+    if saved_camera_name and is_virtual_camera_name(saved_camera_name):
+        print(f"Ignoring saved virtual camera: {saved_camera_name}")
+
     if saved_camera is not None and not is_virtual_camera_name(saved_camera.name):
         print(f"Using saved camera {saved_camera.id}: {saved_camera.name}")
         return saved_camera_id
@@ -239,9 +260,9 @@ def choose_camera_id(requested_camera_id: int) -> int:
         print(f"  {camera.id}: {camera.name}")
 
     preferred_tokens = ("macbook", "facetime", "built-in", "camera macbook")
-    best_camera = cameras[0]
+    best_camera = visible_cameras[0]
     best_score = -999
-    for camera in cameras:
+    for camera in visible_cameras:
         lower = camera.name.lower()
         score = 0
         if any(token in lower for token in preferred_tokens):
@@ -257,4 +278,5 @@ def choose_camera_id(requested_camera_id: int) -> int:
         return 0
 
     print(f"Selected camera {best_camera.id}: {best_camera.name}")
+    save_camera_id(best_camera.id, best_camera.name)
     return best_camera.id
