@@ -383,17 +383,15 @@ class SingleWindowGazeCorrector:
     ) -> None:
         """Update the camera list without blocking the UI thread."""
         with self._camera_refresh_lock:
+            active_id = self._pending_camera_id if self._pending_camera_id is not None else self.camera_id
             if cameras:
-                self.camera_options = [
-                    CameraInfo(camera.id, self._camera_label_overrides.get(camera.id, camera.name))
-                    for camera in cameras
-                ]
+                self.camera_options = self._camera_options_for_display(cameras, active_id)
             elif not self.camera_options:
                 self.camera_options = [CameraInfo(self.camera_id, f"Camera {self.camera_id}")]
 
-            active_id = self._pending_camera_id if self._pending_camera_id is not None else self.camera_id
             if all(camera.id != active_id for camera in self.camera_options):
                 self.camera_options.append(CameraInfo(active_id, f"Camera {active_id}"))
+                self.camera_options = self._deduplicate_camera_options(self.camera_options, active_id)
 
             self.camera_label = self._camera_label_overrides.get(
                 active_id,
@@ -414,6 +412,48 @@ class SingleWindowGazeCorrector:
             self._apply_camera_options(cameras, refresh_finished=True)
 
         threading.Thread(target=worker, name="spec3-camera-refresh", daemon=True).start()
+
+    @staticmethod
+    def _camera_label_key(label: str) -> str:
+        return label.replace("\xa0", " ").strip().casefold()
+
+    def _camera_options_for_display(
+        self,
+        cameras: list[CameraInfo],
+        active_id: int,
+    ) -> list[CameraInfo]:
+        options = [
+            CameraInfo(camera.id, self._camera_label_overrides.get(camera.id, camera.name))
+            for camera in cameras
+        ]
+        return self._deduplicate_camera_options(options, active_id)
+
+    def _deduplicate_camera_options(
+        self,
+        options: list[CameraInfo],
+        active_id: int,
+    ) -> list[CameraInfo]:
+        """Hide stale native slots after OpenCV remaps a physical camera."""
+        active_label = self._camera_label_overrides.get(active_id)
+        if not active_label:
+            return options
+
+        active_key = self._camera_label_key(active_label)
+        cleaned: list[CameraInfo] = []
+        skipped_duplicate = False
+        for camera in options:
+            is_duplicate = (
+                camera.id != active_id
+                and self._camera_label_key(camera.name) == active_key
+            )
+            if is_duplicate:
+                skipped_duplicate = True
+                continue
+            cleaned.append(camera)
+
+        if skipped_duplicate and all(camera.id != active_id for camera in cleaned):
+            cleaned.insert(0, CameraInfo(active_id, active_label))
+        return cleaned
 
     def refresh_camera_options(self, force: bool = False, async_refresh: bool = False) -> None:
         """Refresh camera names shown in the in-app selector."""
@@ -485,7 +525,7 @@ class SingleWindowGazeCorrector:
                     updated_options.append(camera)
             if not replaced:
                 updated_options.append(CameraInfo(camera_id, clean_label))
-            self.camera_options = updated_options
+            self.camera_options = self._deduplicate_camera_options(updated_options, camera_id)
 
     def _fit_text(self, text: str, max_width: int, size: int, bold: bool = False) -> str:
         if self._measure_text(text, size, bold)[0] <= max_width:
@@ -992,6 +1032,9 @@ class SingleWindowGazeCorrector:
 
         if save:
             self._aim_save_when_settled = True
+            self._update_preview_aim_motion(force=True, save=True)
+        elif self._dragging_preview_aim:
+            self._update_preview_aim_motion(force=False, save=False)
 
     def _update_preview_aim_motion(self, force: bool = False, save: bool = False) -> None:
         if self._aim_target_offsets is None:
@@ -1010,14 +1053,15 @@ class SingleWindowGazeCorrector:
         if force:
             next_offsets = target
         else:
-            response = 0.070 if self._dragging_preview_aim else 0.095
+            response = 0.018 if self._dragging_preview_aim else 0.055
             alpha = 1.0 - math.exp(-dt / response)
             raw_next = (
                 current[0] * (1.0 - alpha) + target[0] * alpha,
                 current[1] * (1.0 - alpha) + target[1] * alpha,
             )
-            max_vertical_step = 2.8 * max(0.5, min(dt * 60.0, 1.7))
-            max_horizontal_step = 1.8 * max(0.5, min(dt * 60.0, 1.7))
+            speed_scale = max(0.5, min(dt * 60.0, 1.7))
+            max_vertical_step = (9.5 if self._dragging_preview_aim else 4.4) * speed_scale
+            max_horizontal_step = (6.8 if self._dragging_preview_aim else 3.2) * speed_scale
             next_offsets = (
                 current[0] + max(-max_vertical_step, min(raw_next[0] - current[0], max_vertical_step)),
                 current[1] + max(-max_horizontal_step, min(raw_next[1] - current[1], max_horizontal_step)),
@@ -1031,6 +1075,8 @@ class SingleWindowGazeCorrector:
             return
 
         self._aim_applied_offsets = next_offsets
+        if self._dragging_preview_aim or save:
+            self.gaze_corrector.hold_manual_aim(0.24)
         self.gaze_corrector.set_tuning(
             vertical_offset=next_offsets[0],
             horizontal_offset=next_offsets[1],
@@ -1043,7 +1089,9 @@ class SingleWindowGazeCorrector:
             and abs(next_offsets[0] - target[0]) < 0.08
             and abs(next_offsets[1] - target[1]) < 0.08
         ):
-            if self._aim_save_when_settled:
+            if save:
+                self._aim_save_when_settled = False
+            elif self._aim_save_when_settled:
                 self.gaze_corrector.save_tuning_settings()
                 self._aim_save_when_settled = False
             self._aim_target_offsets = None
@@ -1354,6 +1402,9 @@ class SingleWindowGazeCorrector:
             kwargs["reading_stabilizer"] = value / 100.0
         elif key == "live":
             kwargs["natural_motion"] = value / 100.0
+
+        if key in ("vertical", "horizontal"):
+            self.gaze_corrector.hold_manual_aim(0.24)
 
         self.gaze_corrector.set_tuning(**kwargs)
 
@@ -1781,7 +1832,7 @@ class SingleWindowGazeCorrector:
         next_cap, actual_camera_id = self._open_camera_capture(
             next_camera_id,
             requested_label,
-            allow_remap=False,
+            allow_remap=True,
         )
         if next_cap is None:
             self.logger.log(f"Could not switch to camera {next_camera_id}")
