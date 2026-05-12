@@ -2209,8 +2209,19 @@ class GazeCorrector:
         h, w = original.shape[:2]
         eye_width_px = max(float(roi_w) / 1.5, 1.0)
         gain = 1.04 + 0.22 * np.clip(hold_strength, 0.0, 1.0)
-        raw_shift_x = -float(pupil_delta[0]) * eye_width_px * gain
-        raw_shift_y = -float(pupil_delta[1]) * eye_width_px * gain
+        raw_offset = np.asarray(
+            getattr(eye_data, "pupil_offset", (0.0, 0.0)),
+            dtype=np.float32,
+        )
+        neutral_strength = float(
+            np.clip((0.30 + 0.36 * hold_strength) * correction_alpha, 0.0, 0.72)
+        )
+        horizontal_neutral = 0.22 * neutral_strength
+        vertical_neutral = 0.62 * neutral_strength
+        center_shift_x = -float(raw_offset[0]) * eye_width_px * horizontal_neutral
+        center_shift_y = -float(raw_offset[1]) * eye_width_px * vertical_neutral
+        raw_shift_x = -float(pupil_delta[0]) * eye_width_px * gain + center_shift_x
+        raw_shift_y = -float(pupil_delta[1]) * eye_width_px * gain + center_shift_y
         max_shift_x = w * (0.078 + 0.038 * hold_strength)
         max_shift_y = h * (0.060 + 0.030 * hold_strength)
         shift_x = float(np.clip(raw_shift_x, -max_shift_x, max_shift_x))
