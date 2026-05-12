@@ -121,6 +121,8 @@ class GazeTuningSetting:
         data.pop("reading_x_gain", None)
         data.pop("reading_y_gain", None)
         data.setdefault("reading_stabilizer", 0.90)
+        data["vertical_offset"] = 0.0
+        data["horizontal_offset"] = 0.0
         return cls(**data)
 
 
@@ -1470,7 +1472,10 @@ class GazeCorrector:
             self.hold_filter_value = 0.0
         elif active:
             intensity = np.clip((score - 0.045) / 0.255, 0.0, 1.0)
-            target_hold = float(self.tuning_settings.reading_stabilizer * intensity)
+            power = np.clip(self.tuning_settings.strength, 0.0, 1.5)
+            target_hold = float(
+                np.clip(self.tuning_settings.reading_stabilizer * power * intensity, 0.0, 1.0)
+            )
         else:
             target_hold = 0.0
 
@@ -2371,12 +2376,14 @@ class GazeCorrector:
         correction_motion_alpha = self._motion_correction_alpha()
         if correction_motion_alpha < 0.16:
             return frame
-        natural_scale = 1.0 - min(hold_strength, 1.0) * 0.96
+        if hold_strength <= 0.025:
+            return frame
 
-        # Estimate gaze angle (video_size passed from outside)
-        alpha, _ = self.estimate_gaze_angle(
-            le.center, re.center, video_size, natural_scale=natural_scale
-        )
+        # Reading Stabilizer mode: do not redirect the gaze to a manual point or
+        # to the camera. Only counter the user's small reading saccades around
+        # the natural iris position, with a tiny breathing motion so it does not
+        # look like a frozen robot eye.
+        alpha = self.gaze_filter.apply([0.0, 0.0], natural_scale=0.75)
         if not le_closed and not re_closed:
             le_delta, re_delta = self._paired_pupil_deltas(le, re, hold_strength)
         else:

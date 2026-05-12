@@ -740,9 +740,7 @@ class SingleWindowGazeCorrector:
         preview_y = (canvas_h - preview_h) // 2
         canvas[preview_y:preview_y + preview_h, 0:preview_w] = preview
         self._preview_region = (0, preview_y, preview_w, preview_y + preview_h)
-        self._update_preview_aim_motion()
         cv2.rectangle(canvas, (0, preview_y), (preview_w - 1, preview_y + preview_h - 1), (44, 49, 58), 1)
-        self._draw_preview_aim_overlay(canvas)
 
         self._panel_origin_x = preview_w
         cv2.line(canvas, (preview_w, 0), (preview_w, canvas_h), (54, 60, 72), 1, cv2.LINE_AA)
@@ -812,7 +810,7 @@ class SingleWindowGazeCorrector:
         cv2.circle(canvas, (title_x + 6, title_dot_y), 9, palette["glow"], 1, cv2.LINE_AA)
         title = self._fit_text("spec3 correction", right - title_x - (116 if compact else 150), title_font, bold=True)
         self._draw_text(canvas, title, (title_x + 22, 39 if compact else 43), title_font, text, bold=True)
-        self._draw_text(canvas, self.tr("Live gaze control", "Живой контроль взгляда"), (title_x + 24, 62 if compact else 70), subtitle_font, muted)
+        self._draw_text(canvas, self.tr("Reading stabilizer", "Стабилизация чтения"), (title_x + 24, 62 if compact else 70), subtitle_font, muted)
 
         on_label = "ON" if tuning.enabled and self.gaze_correction_enabled else "OFF"
         self._draw_button(
@@ -840,19 +838,17 @@ class SingleWindowGazeCorrector:
         mode_y1, mode_y2 = (170, 224) if compact else (188, 252)
         self._draw_round_rect(canvas, (left, mode_y1, right, mode_y2), card_bg, 5, card_line)
         cv2.rectangle(canvas, (left, mode_y1 + 1), (left + 5, mode_y2 - 1), mode_color, -1)
-        mode_title = self._fit_text(self.tr("Adaptive mode", "Адаптивный режим"), right - left - 150, 15)
+        mode_title = self._fit_text(self.tr("Reading detector", "Детектор чтения"), right - left - 150, 15)
         self._draw_text(canvas, mode_title, (left + 16, mode_y1 + 23), 14 if compact else 15, text)
         self._draw_text(canvas, mode_label, (right - 82, mode_y1 + 24), 16 if compact else 18, mode_color, bold=True)
         self._draw_meter(canvas, left + 16, mode_y1 + 43, left + 188, reading_score, "read")
         self._draw_meter(canvas, left + 208, mode_y1 + 43, right - 16, effective_hold, "hold")
 
         sliders = [
-            ("strength", self.tr("Strength", "Сила"), tuning.strength * 100.0, 0.0, 150.0, "%"),
-            ("vertical", self.tr("Eyes Up / Down", "Глаза вверх / вниз"), tuning.vertical_offset, -90.0, 90.0, " deg"),
-            ("horizontal", self.tr("Eyes Left / Right", "Глаза влево / вправо"), tuning.horizontal_offset, -45.0, 45.0, " deg"),
-            ("smooth", self.tr("Smooth", "Плавность"), tuning.smoothing * 100.0, 0.0, 100.0, "%"),
-            ("stabilizer", self.tr("Pupil Hold", "Фиксация зрачков"), tuning.reading_stabilizer * 100.0, 0.0, 100.0, "%"),
-            ("live", self.tr("Live Look", "Живой взгляд"), tuning.natural_motion * 100.0, 0.0, 100.0, "%"),
+            ("strength", self.tr("Stabilizer Power", "Сила стабилизации"), tuning.strength * 100.0, 0.0, 150.0, "%"),
+            ("stabilizer", self.tr("Reading Hold", "Удержание чтения"), tuning.reading_stabilizer * 100.0, 0.0, 100.0, "%"),
+            ("smooth", self.tr("Smoothness", "Плавность"), tuning.smoothing * 100.0, 0.0, 100.0, "%"),
+            ("live", self.tr("Eye Life", "Живость глаз"), tuning.natural_motion * 100.0, 0.0, 100.0, "%"),
         ]
 
         row1_y = height - (82 if compact else 88)
@@ -862,8 +858,8 @@ class SingleWindowGazeCorrector:
 
         track_x1 = left + 4
         track_x2 = right - (104 if compact else 112)
-        y = 248 if compact else 284
-        slider_step = 43 if compact else 54
+        y = 258 if compact else 292
+        slider_step = 54 if compact else 64
         for key, label, value, min_value, max_value, suffix in sliders:
             self._draw_slider(canvas, key, label, value, min_value, max_value, suffix, y, track_x1, track_x2)
             y += slider_step
@@ -1340,11 +1336,6 @@ class SingleWindowGazeCorrector:
                 self.camera_dropdown_open = False
                 return
 
-            if self._is_inside_preview(x, y):
-                self._dragging_preview_aim = True
-                self._set_gaze_from_preview_point(x, y, save=False)
-                return
-
             for key, region in self._slider_regions.items():
                 x1, track_y, x2, _min_value, _max_value = region
                 if x1 - 16 <= x <= x2 + 16 and track_y - 18 <= y <= track_y + 18:
@@ -1445,12 +1436,12 @@ class SingleWindowGazeCorrector:
             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA
         )
         cv2.putText(
-            frame, f"Strength {tuning.strength * 100:.0f}%  Smooth {tuning.smoothing * 100:.0f}%",
+            frame, f"Power {tuning.strength * 100:.0f}%  Smooth {tuning.smoothing * 100:.0f}%",
             (20, 73),
             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA
         )
         cv2.putText(
-            frame, f"V {tuning.vertical_offset:+.1f} deg  H {tuning.horizontal_offset:+.1f} deg  Stable {tuning.reading_stabilizer * 100:.0f}%",
+            frame, f"Read hold {tuning.reading_stabilizer * 100:.0f}%  Eye life {tuning.natural_motion * 100:.0f}%",
             (20, 93),
             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA
         )
@@ -1460,7 +1451,7 @@ class SingleWindowGazeCorrector:
             cv2.FONT_HERSHEY_SIMPLEX, 0.38, mode_color, 1, cv2.LINE_AA
         )
         cv2.putText(
-            frame, "Use Gaze Settings sliders | R reset",
+            frame, "Reading Stabilizer | R reset",
             (20, 129),
             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (170, 170, 170), 1, cv2.LINE_AA
         )
