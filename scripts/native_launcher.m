@@ -46,6 +46,11 @@
 @property(nonatomic) NSInteger trainingGuideStep;
 @property(nonatomic) NSTimeInterval trainingGuideStepStartedAt;
 @property(nonatomic) BOOL trainingGuideRunning;
+@property(nonatomic, copy) NSString *trainingLastRecordingLabel;
+@property(nonatomic) BOOL trainingCleanCuePlayed;
+@property(nonatomic) NSTimeInterval trainingLastRecordingRequestAt;
+@property(nonatomic) BOOL trainingModelCompletionCueArmed;
+@property(nonatomic, copy) NSString *trainingModelStatusAtRequest;
 @property(nonatomic, strong) NSWindow *settingsWindow;
 @property(nonatomic, strong) NSTextField *settingsStatusLabel;
 @property(nonatomic, strong) NSTextField *settingsTitleLabel;
@@ -527,6 +532,7 @@
     if (!(self.task && self.task.isRunning)) {
         [self startCamera:nil];
     }
+    [self noteTrainingRecording:@"read" playPrepareCue:YES];
     [self sendCommand:@"record_read"];
     [self refreshTrainingWindowSoon];
 }
@@ -536,6 +542,7 @@
     if (!(self.task && self.task.isRunning)) {
         [self startCamera:nil];
     }
+    [self noteTrainingRecording:@"live" playPrepareCue:YES];
     [self sendCommand:@"record_live"];
     [self refreshTrainingWindowSoon];
 }
@@ -545,13 +552,18 @@
     if (!(self.task && self.task.isRunning)) {
         [self startCamera:nil];
     }
+    [self noteTrainingRecording:@"glance" playPrepareCue:YES];
     [self sendCommand:@"record_glance"];
     [self refreshTrainingWindowSoon];
 }
 
 - (void)stopRecordingSamples:(id)sender {
+    BOOL hadRecording = self.trainingLastRecordingLabel.length > 0 || self.trainingGuideRunning;
     [self cancelGuidedTraining:NO];
     [self sendCommand:@"record_stop"];
+    if (hadRecording) {
+        [self finishTrainingRecordingWithCue:YES];
+    }
     [self refreshTrainingWindowSoon];
 }
 
@@ -560,6 +572,10 @@
     if (!(self.task && self.task.isRunning)) {
         [self startCamera:nil];
     }
+    self.trainingModelCompletionCueArmed = YES;
+    NSDictionary *state = [self readTrainingState];
+    self.trainingModelStatusAtRequest = [state[@"last_status"] isKindOfClass:[NSString class]] ? state[@"last_status"] : @"";
+    [self playTrainingStepCue];
     [self sendCommand:@"train_ai"];
     [self refreshTrainingWindowSoon];
 }
@@ -575,6 +591,7 @@
     self.trainingGuideRunning = YES;
     self.trainingGuideStep = 0;
     self.trainingGuideStepStartedAt = [[NSDate date] timeIntervalSinceReferenceDate];
+    [self noteTrainingRecording:@"read" playPrepareCue:YES];
     [self sendCommand:@"record_read"];
     [self.trainingGuideTimer invalidate];
     self.trainingGuideTimer = [NSTimer scheduledTimerWithTimeInterval:0.4
@@ -595,6 +612,7 @@
     self.trainingGuideTimer = nil;
     if (stopRecording) {
         [self sendCommand:@"record_stop"];
+        [self finishTrainingRecordingWithCue:YES];
     }
     [self refreshTrainingWindowSoon];
 }
@@ -614,6 +632,16 @@
         return @"record_live";
     }
     return @"record_glance";
+}
+
+- (NSString *)guidedTrainingLabelForStep:(NSInteger)step {
+    if (step == 0) {
+        return @"read";
+    }
+    if (step == 1) {
+        return @"live";
+    }
+    return @"glance";
 }
 
 - (NSString *)guidedTrainingTitleForStep:(NSInteger)step {
@@ -650,8 +678,10 @@
     }
 
     if (self.trainingGuideStep < 2) {
+        [self playTrainingStepCue];
         self.trainingGuideStep += 1;
         self.trainingGuideStepStartedAt = now;
+        [self noteTrainingRecording:[self guidedTrainingLabelForStep:self.trainingGuideStep] playPrepareCue:NO];
         [self sendCommand:[self guidedTrainingCommandForStep:self.trainingGuideStep]];
         [self refreshTrainingWindow:nil];
         return;
@@ -662,6 +692,10 @@
     [self.trainingGuideTimer invalidate];
     self.trainingGuideTimer = nil;
     [self sendCommand:@"record_stop"];
+    [self finishTrainingRecordingWithCue:YES];
+    self.trainingModelCompletionCueArmed = YES;
+    NSDictionary *state = [self readTrainingState];
+    self.trainingModelStatusAtRequest = [state[@"last_status"] isKindOfClass:[NSString class]] ? state[@"last_status"] : @"";
     [self sendCommand:@"train_ai"];
     [self refreshTrainingWindowSoon];
 }
@@ -920,6 +954,85 @@
     });
 }
 
+- (void)playTrainingSoundNamed:(NSString *)soundName fallbackBeep:(BOOL)fallbackBeep {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSSound *sound = [NSSound soundNamed:soundName];
+        if (sound) {
+            sound.volume = 0.70;
+            [sound play];
+        } else if (fallbackBeep) {
+            NSBeep();
+        }
+    });
+}
+
+- (void)playTrainingPrepareCue {
+    [self playTrainingSoundNamed:@"Pop" fallbackBeep:YES];
+}
+
+- (void)playTrainingStartCue {
+    [self playTrainingSoundNamed:@"Glass" fallbackBeep:YES];
+}
+
+- (void)playTrainingStepCue {
+    [self playTrainingSoundNamed:@"Ping" fallbackBeep:YES];
+}
+
+- (void)playTrainingDoneCue {
+    [self playTrainingSoundNamed:@"Hero" fallbackBeep:YES];
+}
+
+- (void)noteTrainingRecording:(NSString *)label playPrepareCue:(BOOL)playPrepareCue {
+    self.trainingLastRecordingLabel = label ?: @"";
+    self.trainingCleanCuePlayed = NO;
+    self.trainingLastRecordingRequestAt = [[NSDate date] timeIntervalSinceReferenceDate];
+    if (playPrepareCue) {
+        [self playTrainingPrepareCue];
+    }
+}
+
+- (void)finishTrainingRecordingWithCue:(BOOL)playCue {
+    self.trainingLastRecordingLabel = @"";
+    self.trainingCleanCuePlayed = NO;
+    self.trainingLastRecordingRequestAt = 0.0;
+    if (playCue) {
+        [self playTrainingDoneCue];
+    }
+}
+
+- (void)updateTrainingSoundStateForRecording:(NSString *)recording warmupRemaining:(double)warmupRemaining status:(NSString *)status {
+    if (recording.length == 0) {
+        NSTimeInterval now = [[NSDate date] timeIntervalSinceReferenceDate];
+        BOOL recentRequest = self.trainingLastRecordingRequestAt > 0.0 && now - self.trainingLastRecordingRequestAt < 2.0;
+        if (!recentRequest) {
+            self.trainingLastRecordingLabel = @"";
+            self.trainingCleanCuePlayed = NO;
+        }
+    } else if (![recording isEqualToString:(self.trainingLastRecordingLabel ?: @"")]) {
+        [self noteTrainingRecording:recording playPrepareCue:YES];
+    } else {
+        self.trainingLastRecordingRequestAt = 0.0;
+    }
+
+    if (recording.length > 0 && !self.trainingCleanCuePlayed && warmupRemaining <= 0.05) {
+        self.trainingCleanCuePlayed = YES;
+        [self playTrainingStartCue];
+    }
+
+    if (self.trainingModelCompletionCueArmed && ![status isEqualToString:(self.trainingModelStatusAtRequest ?: @"")]) {
+        BOOL trainingFinished = [status containsString:@"Personal AI trained"] ||
+            [status containsString:@"No training samples"] ||
+            [status containsString:@"Need at least"] ||
+            [status containsString:@"Training became"] ||
+            [status containsString:@"invalid probabilities"];
+        if (trainingFinished) {
+            self.trainingModelCompletionCueArmed = NO;
+            self.trainingModelStatusAtRequest = @"";
+            [self playTrainingDoneCue];
+        }
+    }
+}
+
 - (NSDictionary *)readTrainingState {
     NSData *data = [NSData dataWithContentsOfFile:self.trainingStatePath];
     if (!data) {
@@ -962,6 +1075,7 @@
     double warmupSeconds = [state[@"recording_warmup_seconds"] doubleValue];
     double warmupRemaining = [state[@"recording_warmup_remaining_seconds"] doubleValue];
     double cleanSeconds = [state[@"recording_clean_seconds"] doubleValue];
+    [self updateTrainingSoundStateForRecording:recording warmupRemaining:warmupRemaining status:status];
 
     self.trainingReadLabel.stringValue = [NSString stringWithFormat:@"%@  %ld / %ld", [self textEN:@"READ now" ru:@"ЧТЕНИЕ сейчас"], (long)read, (long)target];
     self.trainingLiveLabel.stringValue = [NSString stringWithFormat:@"%@  %ld / %ld", [self textEN:@"LIVE now" ru:@"ЖИВОЙ сейчас"], (long)live, (long)target];
