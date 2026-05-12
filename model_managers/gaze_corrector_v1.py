@@ -287,7 +287,7 @@ class PupilHoldFilter:
         release_score = float(np.clip(release_score, 0.0, 1.0))
 
         # Strong stabilizer: ignore fast reading saccades, but follow sustained gaze shifts.
-        base_follow = 0.004 + ((1.0 - stabilizer_strength) ** 2) * 0.18
+        base_follow = 0.002 + ((1.0 - stabilizer_strength) ** 2) * 0.14
         sustained_follow = max(0.0, (release_score - 0.55) / 0.45) * 0.32
         hard_follow = 0.0
         if distance > 0.55:
@@ -481,7 +481,7 @@ class ReadingActivityDetector:
             evidence *= 0.04
 
         if evidence > 0.38:
-            self.active_until = max(self.active_until, now + 0.46)
+            self.active_until = max(self.active_until, now + 0.62)
 
         if evidence > 0.56:
             rate = 0.86
@@ -494,7 +494,7 @@ class ReadingActivityDetector:
         if now < self.release_until:
             self.active = False
         elif self.active:
-            self.active = self.score > 0.13 or now < self.active_until
+            self.active = self.score > 0.11 or now < self.active_until
         else:
             self.active = self.score > 0.22 or evidence > 0.46
         return self.active, self.score
@@ -1471,7 +1471,7 @@ class GazeCorrector:
                 self.eye_output_hold_filter.reset()
             self.hold_filter_value = 0.0
         elif active:
-            intensity = np.clip((score - 0.045) / 0.255, 0.0, 1.0)
+            intensity = np.clip((score - 0.035) / 0.245, 0.0, 1.0)
             power = np.clip(self.tuning_settings.strength, 0.0, 1.5)
             target_hold = float(
                 np.clip(self.tuning_settings.reading_stabilizer * power * intensity, 0.0, 1.0)
@@ -1481,7 +1481,7 @@ class GazeCorrector:
 
         dt = max(1.0 / 120.0, min(now - self.hold_filter_time, 0.12))
         self.hold_filter_time = now
-        tau = 0.022 if target_hold >= self.hold_filter_value else 0.052
+        tau = 0.016 if target_hold >= self.hold_filter_value else 0.070
         alpha = 1.0 - math.exp(-dt / tau)
         hold = self.hold_filter_value * (1.0 - alpha) + target_hold * alpha
         self.hold_filter_value = float(np.clip(hold, 0.0, 1.0))
@@ -1592,8 +1592,8 @@ class GazeCorrector:
         if stabilizer <= 0.01:
             return delta
 
-        max_x = 0.105 + 0.055 * (1.0 - stabilizer)
-        max_y = 0.060 + 0.035 * (1.0 - stabilizer)
+        max_x = 0.128 + 0.045 * (1.0 - stabilizer)
+        max_y = 0.074 + 0.030 * (1.0 - stabilizer)
         limited = np.asarray(
             [
                 np.clip(delta[0], -max_x, max_x),
@@ -1601,7 +1601,7 @@ class GazeCorrector:
             ],
             dtype=np.float32,
         )
-        max_mag = 0.125 + 0.070 * (1.0 - stabilizer)
+        max_mag = 0.150 + 0.060 * (1.0 - stabilizer)
         mag = float(np.linalg.norm(limited))
         if mag > max_mag:
             limited *= max_mag / mag
@@ -2138,6 +2138,142 @@ class GazeCorrector:
         output = retargeted * retarget_mix + original * (1.0 - retarget_mix)
         return np.clip(output, 0.0, 1.0), np.clip(alpha_boost, 0.0, 0.98), intensity
 
+    def _blend_reading_stabilized_iris(
+        self,
+        frame: np.ndarray,
+        eye_data,
+        eye_side: str,
+        pupil_delta: np.ndarray,
+        hold_strength: float,
+        correction_alpha: float,
+    ) -> bool:
+        """Stabilize READ using the user's real iris texture instead of synthetic warp."""
+        if hold_strength <= 0.025 or correction_alpha <= 0.01:
+            return False
+
+        row, col = eye_data.top_left
+        roi_h, roi_w = eye_data.original_size
+        frame_h, frame_w = frame.shape[:2]
+
+        dst_top = max(row, 0)
+        dst_left = max(col, 0)
+        dst_bottom = min(row + roi_h, frame_h)
+        dst_right = min(col + roi_w, frame_w)
+        if dst_bottom <= dst_top or dst_right <= dst_left:
+            return False
+
+        src_top = dst_top - row
+        src_left = dst_left - col
+        src_bottom = src_top + (dst_bottom - dst_top)
+        src_right = src_left + (dst_right - dst_left)
+
+        original = frame[dst_top:dst_bottom, dst_left:dst_right].astype(np.float32) / 255.0
+        aperture = np.clip(self._eye_contour_mask(eye_data, eye_data.original_size), 0.0, 1.0)
+        work_mask = self._iris_work_mask(eye_data, eye_data.original_size)
+        source_hint = self._landmark_iris_mask(
+            eye_data,
+            eye_data.original_size,
+            scale=1.18,
+        )
+
+        aperture_crop = aperture[src_top:src_bottom, src_left:src_right]
+        work_crop = work_mask[src_top:src_bottom, src_left:src_right]
+        hint_crop = source_hint[src_top:src_bottom, src_left:src_right]
+        source_iris = self._iris_detail_mask(original, aperture_crop, work_crop)
+        if hint_crop.shape == aperture_crop.shape:
+            hint_region = np.logical_and(hint_crop > 0.05, aperture_crop > 0.12)
+            if int(np.sum(hint_region)) >= 8:
+                luma = original.mean(axis=2)
+                hint_values = luma[hint_region]
+                hint_threshold = float(
+                    np.clip(np.percentile(hint_values, 48) + 0.035, 0.22, 0.50)
+                )
+                hint_dark = np.clip(
+                    (hint_threshold - luma) / max(0.095, hint_threshold * 0.50),
+                    0.0,
+                    1.0,
+                )
+                source_iris = np.maximum(source_iris, hint_dark * hint_crop * aperture_crop)
+
+        center_hint = None
+        moments_hint = cv2.moments((hint_crop > 0.16).astype(np.uint8))
+        if moments_hint["m00"] > 0:
+            center_hint = (
+                float(moments_hint["m10"] / moments_hint["m00"]),
+                float(moments_hint["m01"] / moments_hint["m00"]),
+            )
+        source_iris = self._keep_iris_component(source_iris, center_hint)
+        if float(source_iris.max()) <= 0.05:
+            return False
+
+        h, w = original.shape[:2]
+        eye_width_px = max(float(roi_w) / 1.5, 1.0)
+        gain = 1.04 + 0.22 * np.clip(hold_strength, 0.0, 1.0)
+        raw_shift_x = -float(pupil_delta[0]) * eye_width_px * gain
+        raw_shift_y = -float(pupil_delta[1]) * eye_width_px * gain
+        max_shift_x = w * (0.078 + 0.038 * hold_strength)
+        max_shift_y = h * (0.060 + 0.030 * hold_strength)
+        shift_x = float(np.clip(raw_shift_x, -max_shift_x, max_shift_x))
+        shift_y = float(np.clip(raw_shift_y, -max_shift_y, max_shift_y))
+        shift_mag = math.hypot(shift_x, shift_y)
+        if shift_mag < 0.12:
+            return False
+
+        matrix = np.asarray([[1.0, 0.0, shift_x], [0.0, 1.0, shift_y]], dtype=np.float32)
+        shifted_eye = cv2.warpAffine(
+            original.astype(np.float32),
+            matrix,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        shifted_mask = cv2.warpAffine(
+            source_iris.astype(np.float32),
+            matrix,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        visibility = self._aperture_visibility_mask(aperture_crop, hold_strength)
+        shifted_mask = np.clip(shifted_mask * visibility, 0.0, 1.0)
+        if float(shifted_mask.max()) <= 0.05:
+            return False
+
+        cleanup_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (
+                max(3, int(w * (0.085 + 0.030 * hold_strength)) | 1),
+                max(3, int(h * (0.150 + 0.052 * hold_strength)) | 1),
+            ),
+        )
+        cleanup = cv2.dilate((source_iris > 0.035).astype(np.uint8), cleanup_kernel, iterations=1)
+        cleanup = np.clip(cleanup.astype(np.float32) * aperture_crop, 0.0, 1.0)
+        cleanup_soft = np.clip(cv2.GaussianBlur(cleanup, (5, 5), 0), 0.0, 1.0)
+
+        original_u8 = np.clip(original * 255.0, 0, 255).astype(np.uint8)
+        inpaint_mask = (cleanup > 0.08).astype(np.uint8) * 255
+        if int(np.count_nonzero(inpaint_mask)) > 0:
+            cleaned = cv2.inpaint(original_u8, inpaint_mask, 3, cv2.INPAINT_TELEA).astype(np.float32) / 255.0
+        else:
+            cleaned = original.copy()
+
+        shifted_mask = np.clip(cv2.GaussianBlur(shifted_mask, (5, 5), 0), 0.0, 1.0)
+        retargeted = shifted_eye * shifted_mask[:, :, None] + cleaned * (1.0 - shifted_mask[:, :, None])
+        mix = float(
+            np.clip(
+                (0.42 + 0.46 * hold_strength) * correction_alpha * self._smoothstep(0.0, 3.2, shift_mag),
+                0.0,
+                0.92,
+            )
+        )
+        blend_alpha = np.maximum(cleanup_soft * 0.82, shifted_mask * 0.95) * mix
+        blend_alpha = np.clip(blend_alpha, 0.0, 0.92)
+
+        final = retargeted * blend_alpha[:, :, None] + original * (1.0 - blend_alpha[:, :, None])
+        frame[dst_top:dst_bottom, dst_left:dst_right] = np.clip(final * 255.0, 0, 255).astype(np.uint8)
+        return True
+
     def _sharpen_corrected_eye(self, image: np.ndarray) -> np.ndarray:
         """Recover a little crispness from the low-resolution generated eye crop."""
         img = image.astype(np.float32)
@@ -2379,11 +2515,6 @@ class GazeCorrector:
         if hold_strength <= 0.025:
             return frame
 
-        # Reading Stabilizer mode: do not redirect the gaze to a manual point or
-        # to the camera. Only counter the user's small reading saccades around
-        # the natural iris position, with a tiny breathing motion so it does not
-        # look like a frozen robot eye.
-        alpha = self.gaze_filter.apply([0.0, 0.0], natural_scale=0.75)
         if not le_closed and not re_closed:
             le_delta, re_delta = self._paired_pupil_deltas(le, re, hold_strength)
         else:
@@ -2404,38 +2535,18 @@ class GazeCorrector:
                 * correction_motion_alpha
                 * self._openness_correction_alpha(le)
             )
-            le_alpha = self._angle_with_pupil_delta(alpha, le_delta, hold_strength)
             le_hold = hold_strength * le_blend
             if le_blend > 0.01:
-                le_corrected = self.correct_eye(le, "L", le_alpha, le_hold, le_delta)
-                self._blend_eye_region(
-                    frame,
-                    le,
-                    "L",
-                    le_corrected,
-                    le_hold,
-                    le_blend,
-                    le_alpha,
-                )
+                self._blend_reading_stabilized_iris(frame, le, "L", le_delta, le_hold, le_blend)
         if not re_closed:
             re_blend = (
                 self._reopen_blend_strength("R")
                 * correction_motion_alpha
                 * self._openness_correction_alpha(re)
             )
-            re_alpha = self._angle_with_pupil_delta(alpha, re_delta, hold_strength)
             re_hold = hold_strength * re_blend
             if re_blend > 0.01:
-                re_corrected = self.correct_eye(re, "R", re_alpha, re_hold, re_delta)
-                self._blend_eye_region(
-                    frame,
-                    re,
-                    "R",
-                    re_corrected,
-                    re_hold,
-                    re_blend,
-                    re_alpha,
-                )
+                self._blend_reading_stabilized_iris(frame, re, "R", re_delta, re_hold, re_blend)
 
         return frame
 
