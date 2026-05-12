@@ -96,6 +96,8 @@ class GazeTuningSetting:
     strength: float = 1.0
     vertical_offset: float = 0.0
     horizontal_offset: float = 0.0
+    read_target_x: float = 0.0
+    read_target_y: float = 0.0
     smoothing: float = 0.84
     reading_stabilizer: float = 0.90
     natural_motion: float = 0.06
@@ -106,6 +108,8 @@ class GazeTuningSetting:
             "strength": self.strength,
             "vertical_offset": self.vertical_offset,
             "horizontal_offset": self.horizontal_offset,
+            "read_target_x": self.read_target_x,
+            "read_target_y": self.read_target_y,
             "smoothing": self.smoothing,
             "reading_stabilizer": self.reading_stabilizer,
             "natural_motion": self.natural_motion,
@@ -121,6 +125,12 @@ class GazeTuningSetting:
         data.pop("reading_x_gain", None)
         data.pop("reading_y_gain", None)
         data.setdefault("reading_stabilizer", 0.90)
+        data["read_target_x"] = 0.0
+        try:
+            read_target_y = float(data.get("read_target_y", 0.0))
+        except (TypeError, ValueError):
+            read_target_y = 0.0
+        data["read_target_y"] = max(-0.16, min(read_target_y, 0.16))
         data["vertical_offset"] = 0.0
         data["horizontal_offset"] = 0.0
         return cls(**data)
@@ -568,13 +578,41 @@ class ReadingActivityDetector:
 
         read_margin = probability - threshold
         live_margin = threshold - probability
-        if read_margin >= -0.02:
+        ai_read_motion = (
+            central_scan
+            or (
+                center_score > 0.08
+                and stable_vertical
+                and small_steps >= 2
+                and active_steps >= 2
+                and active_ratio > 0.18
+                and active_span > 0.07
+                and total_motion > 0.009
+                and horizontal_motion > 0.0011
+                and max_step < 0.048
+                and median_step < 0.030
+                and (
+                    sign_changes >= 1
+                    or recent_changes >= 1
+                    or fresh_changes >= 1
+                    or bidirectional > 0.07
+                )
+            )
+        )
+        hard_glance_veto = directed_glance and not ai_read_motion
+        if hard_glance_veto:
+            evidence *= 0.08
+            release = max(release, 0.82 if live_margin >= -0.05 else 0.62)
+        elif read_margin >= -0.02 and ai_read_motion:
             learned_evidence = 0.50 + np.clip(read_margin + 0.02, 0.0, 0.30) * 1.25
             evidence = max(evidence, learned_evidence)
             release *= 0.18 if read_margin >= 0.04 else 0.45
         elif central_scan:
             evidence = max(evidence, 0.49 if probability >= 0.18 else 0.43)
             release *= 0.25
+        elif read_margin >= 0.08 and not directed_glance:
+            evidence = max(evidence, 0.36)
+            release *= 0.65
         elif directed_glance and live_margin >= 0.08:
             evidence *= 0.10
             release = max(release, 0.72)
@@ -850,6 +888,36 @@ class ReadingActivityDetector:
             and stable_vertical
             and path_direct_ratio < 0.86
         )
+        centered_read_pulse = (
+            center_zone
+            and small_step_count >= 2
+            and active_step_count >= 2
+            and active_ratio > 0.20
+            and active_span > 0.075
+            and total_horizontal_motion > 0.009
+            and horizontal_motion > 0.0011
+            and max_step < 0.038
+            and median_active_step < 0.024
+            and stable_vertical
+            and (
+                sign_changes >= 1
+                or recent_changes >= 1
+                or fresh_changes >= 1
+                or bidirectional_ratio > 0.075
+            )
+        )
+        sustained_center_scan = (
+            center_zone
+            and small_step_count >= 4
+            and active_step_count >= 4
+            and active_span > 0.16
+            and total_horizontal_motion > 0.014
+            and horizontal_motion > 0.0013
+            and max_step < 0.038
+            and median_active_step < 0.024
+            and path_direct_ratio < 0.76
+            and stable_vertical
+        )
         progressive_reading_scan = (
             small_step_count >= 3
             and active_step_count >= 3
@@ -885,7 +953,14 @@ class ReadingActivityDetector:
             and stable_vertical
             and center_zone
         )
-        read_like = central_micro_read or progressive_reading_scan or alternating_motion or long_micro_scan
+        read_like = (
+            central_micro_read
+            or centered_read_pulse
+            or sustained_center_scan
+            or progressive_reading_scan
+            or alternating_motion
+            or long_micro_scan
+        )
         if not read_like:
             return 0.0, 0.0
 
@@ -919,6 +994,10 @@ class ReadingActivityDetector:
             evidence = max(evidence, 0.50)
         if central_micro_read:
             evidence = max(evidence, 0.50)
+        if centered_read_pulse:
+            evidence = max(evidence, 0.54)
+        if sustained_center_scan:
+            evidence = max(evidence, 0.52)
         if alternating_motion:
             evidence = max(evidence, 0.52 + min(sign_changes, 3) * 0.04)
         if long_micro_scan:
@@ -1119,6 +1198,7 @@ class GazeCorrector:
         self.eye_closed_previous = {"L": False, "R": False}
         self.eye_reopen_time = {"L": 0.0, "R": 0.0}
         self.manual_aim_until = 0.0
+        self.read_life_start = time.monotonic()
 
     def _load_camera_settings(self) -> CameraUserSetting:
         """Load camera settings from database or return defaults."""
@@ -1325,6 +1405,8 @@ class GazeCorrector:
         strength: float | None = None,
         vertical_offset: float | None = None,
         horizontal_offset: float | None = None,
+        read_target_x: float | None = None,
+        read_target_y: float | None = None,
         smoothing: float | None = None,
         reading_stabilizer: float | None = None,
         natural_motion: float | None = None,
@@ -1351,6 +1433,10 @@ class GazeCorrector:
             self.tuning_settings.vertical_offset = max(-90.0, min(vertical_offset, 90.0))
         if horizontal_offset is not None:
             self.tuning_settings.horizontal_offset = max(-45.0, min(horizontal_offset, 45.0))
+        if read_target_x is not None:
+            self.tuning_settings.read_target_x = 0.0
+        if read_target_y is not None:
+            self.tuning_settings.read_target_y = max(-0.16, min(read_target_y, 0.16))
         if smoothing is not None:
             self.tuning_settings.smoothing = max(0.0, min(smoothing, 1.0))
         if reading_stabilizer is not None:
@@ -1652,6 +1738,39 @@ class GazeCorrector:
             return 1.0 if value >= edge1 else 0.0
         t = float(np.clip((value - edge0) / (edge1 - edge0), 0.0, 1.0))
         return t * t * (3.0 - 2.0 * t)
+
+    def _reading_life_shift_px(
+        self,
+        eye_side: str,
+        hold_strength: float,
+        correction_alpha: float,
+        eye_width_px: float,
+    ) -> tuple[float, float]:
+        """Add a tiny slow drift so a held reading gaze does not look frozen."""
+        hold_gate = self._smoothstep(0.18, 0.82, hold_strength)
+        alpha_gate = self._smoothstep(0.08, 0.55, correction_alpha)
+        if hold_gate <= 0.001 or alpha_gate <= 0.001:
+            return 0.0, 0.0
+
+        user_life = float(np.clip(self.tuning_settings.natural_motion, 0.0, 1.0))
+        life_amount = 0.26 + 0.74 * user_life
+        t = time.monotonic() - self.read_life_start
+
+        max_px = float(np.clip(eye_width_px * 0.018, 0.45, 1.35))
+        scale = max_px * life_amount * hold_gate * alpha_gate
+        side_scale = 1.0 if eye_side == "L" else 0.94
+        side_micro = -1.0 if eye_side == "L" else 1.0
+        horizontal = (
+            math.sin(t * 0.54 + 2.15) * 0.15
+            + math.sin(t * 0.19 + 0.70) * 0.07
+            + side_micro * math.sin(t * 0.29 + 1.20) * 0.025
+        ) * side_scale
+        vertical = (
+            math.sin(t * 1.03) * 0.38
+            + math.sin(t * 0.33 + 1.85) * 0.23
+            + side_micro * math.sin(t * 0.24 + 2.40) * 0.018
+        ) * side_scale
+        return horizontal * scale, vertical * scale
 
     def _eye_is_closed(self, eye_data) -> bool:
         """Detect blink/closed eye; DeepWarp must not draw an open pupil then."""
@@ -2213,17 +2332,27 @@ class GazeCorrector:
             getattr(eye_data, "pupil_offset", (0.0, 0.0)),
             dtype=np.float32,
         )
-        neutral_strength = float(
-            np.clip((0.30 + 0.36 * hold_strength) * correction_alpha, 0.0, 0.72)
+        read_target_x = 0.0
+        read_target_y = float(np.clip(self.tuning_settings.read_target_y, -0.16, 0.16))
+        target_strength = float(
+            np.clip((0.26 + 0.30 * hold_strength) * correction_alpha, 0.0, 0.56)
         )
-        horizontal_neutral = 0.22 * neutral_strength
-        vertical_neutral = 0.62 * neutral_strength
-        center_shift_x = -float(raw_offset[0]) * eye_width_px * horizontal_neutral
-        center_shift_y = -float(raw_offset[1]) * eye_width_px * vertical_neutral
-        raw_shift_x = -float(pupil_delta[0]) * eye_width_px * gain + center_shift_x
-        raw_shift_y = -float(pupil_delta[1]) * eye_width_px * gain + center_shift_y
-        max_shift_x = w * (0.078 + 0.038 * hold_strength)
-        max_shift_y = h * (0.060 + 0.030 * hold_strength)
+        horizontal_target = 0.0
+        vertical_target = 0.52 * target_strength
+        target_shift_x = -float(raw_offset[0] - read_target_x) * eye_width_px * horizontal_target
+        target_shift_y = -float(raw_offset[1] - read_target_y) * eye_width_px * vertical_target
+        raw_shift_x = -float(pupil_delta[0]) * eye_width_px * gain + target_shift_x
+        raw_shift_y = -float(pupil_delta[1]) * eye_width_px * gain + target_shift_y
+        life_shift_x, life_shift_y = self._reading_life_shift_px(
+            eye_side,
+            hold_strength,
+            correction_alpha,
+            eye_width_px,
+        )
+        raw_shift_x += life_shift_x
+        raw_shift_y += life_shift_y
+        max_shift_x = w * (0.068 + 0.026 * hold_strength)
+        max_shift_y = h * (0.040 + 0.020 * hold_strength)
         shift_x = float(np.clip(raw_shift_x, -max_shift_x, max_shift_x))
         shift_y = float(np.clip(raw_shift_y, -max_shift_y, max_shift_y))
         shift_mag = math.hypot(shift_x, shift_y)
@@ -2270,16 +2399,29 @@ class GazeCorrector:
             cleaned = original.copy()
 
         shifted_mask = np.clip(cv2.GaussianBlur(shifted_mask, (5, 5), 0), 0.0, 1.0)
+        if hint_crop.shape == shifted_mask.shape:
+            shifted_hint = cv2.warpAffine(
+                hint_crop.astype(np.float32),
+                matrix,
+                (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0.0,
+            )
+            shifted_mask = np.minimum(
+                shifted_mask,
+                np.clip(cv2.GaussianBlur(shifted_hint, (3, 3), 0) * 1.35, 0.0, 1.0),
+            )
         retargeted = shifted_eye * shifted_mask[:, :, None] + cleaned * (1.0 - shifted_mask[:, :, None])
         mix = float(
             np.clip(
-                (0.42 + 0.46 * hold_strength) * correction_alpha * self._smoothstep(0.0, 3.2, shift_mag),
+                (0.28 + 0.34 * hold_strength) * correction_alpha * self._smoothstep(0.0, 2.4, shift_mag),
                 0.0,
-                0.92,
+                0.68,
             )
         )
-        blend_alpha = np.maximum(cleanup_soft * 0.82, shifted_mask * 0.95) * mix
-        blend_alpha = np.clip(blend_alpha, 0.0, 0.92)
+        blend_alpha = (cleanup_soft * 0.34 + shifted_mask * 0.88) * mix
+        blend_alpha = np.clip(blend_alpha, 0.0, 0.68)
 
         final = retargeted * blend_alpha[:, :, None] + original * (1.0 - blend_alpha[:, :, None])
         frame[dst_top:dst_bottom, dst_left:dst_right] = np.clip(final * 255.0, 0, 255).astype(np.uint8)

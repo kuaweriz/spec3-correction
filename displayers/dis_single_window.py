@@ -71,6 +71,9 @@ UI_STYLE_PALETTES = {
 }
 
 
+READ_TARGET_RANGE = 0.16
+
+
 @lru_cache(maxsize=96)
 def _load_ui_font(size: int, bold: bool = False, font_style: str = "rounded"):
     if ImageFont is None:
@@ -452,23 +455,28 @@ class SingleWindowGazeCorrector:
     ) -> list[CameraInfo]:
         """Hide stale native slots after OpenCV remaps a physical camera."""
         active_label = self._camera_label_overrides.get(active_id)
-        if not active_label:
-            return options
-
-        active_key = self._camera_label_key(active_label)
         cleaned: list[CameraInfo] = []
-        skipped_duplicate = False
+        seen: dict[str, int] = {}
         for camera in options:
-            is_duplicate = (
-                camera.id != active_id
-                and self._camera_label_key(camera.name) == active_key
-            )
-            if is_duplicate:
-                skipped_duplicate = True
+            label = self._camera_label_overrides.get(camera.id, camera.name)
+            key = self._camera_label_key(label)
+            if not key:
                 continue
-            cleaned.append(camera)
+            existing_index = seen.get(key)
+            if existing_index is None:
+                seen[key] = len(cleaned)
+                cleaned.append(CameraInfo(camera.id, label))
+                continue
 
-        if skipped_duplicate and all(camera.id != active_id for camera in cleaned):
+            if camera.id == active_id:
+                cleaned[existing_index] = CameraInfo(camera.id, label)
+                continue
+
+            existing = cleaned[existing_index]
+            if existing.id == active_id:
+                continue
+
+        if active_label and all(camera.id != active_id for camera in cleaned):
             cleaned.insert(0, CameraInfo(active_id, active_label))
         return cleaned
 
@@ -720,6 +728,7 @@ class SingleWindowGazeCorrector:
 
     def compose_app_frame(self, frame: np.ndarray) -> np.ndarray:
         """Compose the camera preview and the control panel into one window."""
+        self._update_preview_aim_motion()
         frame_h, frame_w = frame.shape[:2]
         max_w, max_h = self.preview_max_size
         scale = min(max_w / max(frame_w, 1), max_h / max(frame_h, 1))
@@ -846,6 +855,7 @@ class SingleWindowGazeCorrector:
 
         sliders = [
             ("strength", self.tr("Stabilizer Power", "Сила стабилизации"), tuning.strength * 100.0, 0.0, 150.0, "%"),
+            ("read_y", self.tr("Eye Direction", "Направление зрачков"), tuning.read_target_y / READ_TARGET_RANGE * 100.0, -100.0, 100.0, "%"),
             ("stabilizer", self.tr("Reading Hold", "Удержание чтения"), tuning.reading_stabilizer * 100.0, 0.0, 100.0, "%"),
             ("smooth", self.tr("Smoothness", "Плавность"), tuning.smoothing * 100.0, 0.0, 100.0, "%"),
             ("live", self.tr("Eye Life", "Живость глаз"), tuning.natural_motion * 100.0, 0.0, 100.0, "%"),
@@ -858,8 +868,8 @@ class SingleWindowGazeCorrector:
 
         track_x1 = left + 4
         track_x2 = right - (104 if compact else 112)
-        y = 258 if compact else 292
-        slider_step = 54 if compact else 64
+        y = 248 if compact else 282
+        slider_step = 48 if compact else 58
         for key, label, value, min_value, max_value, suffix in sliders:
             self._draw_slider(canvas, key, label, value, min_value, max_value, suffix, y, track_x1, track_x2)
             y += slider_step
@@ -1006,15 +1016,12 @@ class SingleWindowGazeCorrector:
         if point is None or self._preview_region is None:
             return None
 
-        px, py = point
+        _px, py = point
         x1, y1, x2, y2 = self._preview_region
-        nx = ((px - x1) / max(1, x2 - x1 - 1) - 0.5) * 2.0
         ny = ((py - y1) / max(1, y2 - y1 - 1) - 0.5) * 2.0
-        nx = math.copysign(abs(nx) ** 1.18, nx)
         ny = math.copysign(abs(ny) ** 1.18, ny)
-        horizontal = max(-45.0, min(nx * 45.0, 45.0))
-        vertical = max(-90.0, min(-ny * 90.0, 90.0))
-        return vertical, horizontal
+        read_target_y = max(-READ_TARGET_RANGE, min(ny * READ_TARGET_RANGE, READ_TARGET_RANGE))
+        return read_target_y, 0.0
 
     def _offsets_to_preview_point(self, offsets: tuple[float, float] | None = None) -> tuple[int, int] | None:
         if self._preview_region is None:
@@ -1022,10 +1029,10 @@ class SingleWindowGazeCorrector:
 
         if offsets is None:
             tuning = self.gaze_corrector.get_tuning()
-            offsets = (tuning.vertical_offset, tuning.horizontal_offset)
+            offsets = (tuning.read_target_y, 0.0)
         x1, y1, x2, y2 = self._preview_region
-        nx = max(-1.0, min(offsets[1] / 45.0, 1.0))
-        ny = max(-1.0, min(-offsets[0] / 90.0, 1.0))
+        nx = 0.0
+        ny = max(-1.0, min(offsets[0] / READ_TARGET_RANGE, 1.0))
         nx = math.copysign(abs(nx) ** (1.0 / 1.18), nx)
         ny = math.copysign(abs(ny) ** (1.0 / 1.18), ny)
         x = int(x1 + (nx * 0.5 + 0.5) * max(1, x2 - x1 - 1))
@@ -1041,11 +1048,11 @@ class SingleWindowGazeCorrector:
         self._aim_visible_until = time.monotonic() + 1.2
         if self._aim_applied_offsets is None:
             tuning = self.gaze_corrector.get_tuning()
-            self._aim_applied_offsets = (tuning.vertical_offset, tuning.horizontal_offset)
+            self._aim_applied_offsets = (tuning.read_target_y, 0.0)
 
         if save:
             self._aim_save_when_settled = True
-            self._update_preview_aim_motion(force=True, save=True)
+            self._update_preview_aim_motion(force=False, save=False)
         elif self._dragging_preview_aim:
             self._update_preview_aim_motion(force=False, save=False)
 
@@ -1059,22 +1066,22 @@ class SingleWindowGazeCorrector:
 
         if self._aim_applied_offsets is None:
             tuning = self.gaze_corrector.get_tuning()
-            self._aim_applied_offsets = (tuning.vertical_offset, tuning.horizontal_offset)
+            self._aim_applied_offsets = (tuning.read_target_y, 0.0)
 
         current = self._aim_applied_offsets
         target = self._aim_target_offsets
         if force:
             next_offsets = target
         else:
-            response = 0.018 if self._dragging_preview_aim else 0.055
+            response = 0.012 if self._dragging_preview_aim else 0.055
             alpha = 1.0 - math.exp(-dt / response)
             raw_next = (
                 current[0] * (1.0 - alpha) + target[0] * alpha,
                 current[1] * (1.0 - alpha) + target[1] * alpha,
             )
             speed_scale = max(0.5, min(dt * 60.0, 1.7))
-            max_vertical_step = (9.5 if self._dragging_preview_aim else 4.4) * speed_scale
-            max_horizontal_step = (6.8 if self._dragging_preview_aim else 3.2) * speed_scale
+            max_vertical_step = (0.050 if self._dragging_preview_aim else 0.030) * speed_scale
+            max_horizontal_step = (0.050 if self._dragging_preview_aim else 0.030) * speed_scale
             next_offsets = (
                 current[0] + max(-max_vertical_step, min(raw_next[0] - current[0], max_vertical_step)),
                 current[1] + max(-max_horizontal_step, min(raw_next[1] - current[1], max_horizontal_step)),
@@ -1082,25 +1089,32 @@ class SingleWindowGazeCorrector:
 
         if (
             not force
-            and abs(next_offsets[0] - current[0]) < 0.025
-            and abs(next_offsets[1] - current[1]) < 0.025
+            and abs(next_offsets[0] - current[0]) < 0.0015
+            and abs(next_offsets[1] - current[1]) < 0.0015
         ):
+            if (
+                self._aim_save_when_settled
+                and abs(current[0] - target[0]) < 0.004
+                and abs(current[1] - target[1]) < 0.004
+            ):
+                self.gaze_corrector.save_tuning_settings()
+                self._aim_save_when_settled = False
+                self._aim_target_offsets = None
+                self._aim_applied_offsets = None
             return
 
         self._aim_applied_offsets = next_offsets
-        if self._dragging_preview_aim or save:
-            self.gaze_corrector.hold_manual_aim(0.24)
         self.gaze_corrector.set_tuning(
-            vertical_offset=next_offsets[0],
-            horizontal_offset=next_offsets[1],
+            read_target_y=next_offsets[0],
+            read_target_x=0.0,
             save=save,
             reset_tracking=False,
         )
 
         if save or (
             not self._dragging_preview_aim
-            and abs(next_offsets[0] - target[0]) < 0.08
-            and abs(next_offsets[1] - target[1]) < 0.08
+            and abs(next_offsets[0] - target[0]) < 0.004
+            and abs(next_offsets[1] - target[1]) < 0.004
         ):
             if save:
                 self._aim_save_when_settled = False
@@ -1336,6 +1350,11 @@ class SingleWindowGazeCorrector:
                 self.camera_dropdown_open = False
                 return
 
+            if self._is_inside_preview(x, y):
+                self._dragging_preview_aim = True
+                self._set_gaze_from_preview_point(x, y, save=False)
+                return
+
             for key, region in self._slider_regions.items():
                 x1, track_y, x2, _min_value, _max_value = region
                 if x1 - 16 <= x <= x2 + 16 and track_y - 18 <= y <= track_y + 18:
@@ -1404,6 +1423,9 @@ class SingleWindowGazeCorrector:
             kwargs["vertical_offset"] = value
         elif key == "horizontal":
             kwargs["horizontal_offset"] = value
+        elif key == "read_y":
+            kwargs["read_target_y"] = value / 100.0 * READ_TARGET_RANGE
+            kwargs["read_target_x"] = 0.0
         elif key == "smooth":
             kwargs["smoothing"] = value / 100.0
         elif key == "stabilizer":
@@ -1441,7 +1463,8 @@ class SingleWindowGazeCorrector:
             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA
         )
         cv2.putText(
-            frame, f"Read hold {tuning.reading_stabilizer * 100:.0f}%  Eye life {tuning.natural_motion * 100:.0f}%",
+            frame,
+            f"Eye direction {tuning.read_target_y / READ_TARGET_RANGE * 100:+.0f}%",
             (20, 93),
             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA
         )
@@ -1698,25 +1721,18 @@ class SingleWindowGazeCorrector:
         )
         return usable, score, mean, std, bright_ratio
 
+    def _frame_looks_blank(self, frame: np.ndarray) -> bool:
+        """Detect AVFoundation placeholder frames that look opened but are not a live camera."""
+        usable, _score, mean, std, bright_ratio = self._frame_live_metrics(frame)
+        return not usable and mean < 4.0 and std < 11.0 and bright_ratio < 0.025
+
     def _camera_candidate_ids(self, preferred_id: int, requested_label: str) -> list[int]:
         candidates: list[int] = []
         with self._camera_refresh_lock:
             camera_options = list(self._all_camera_options or self.camera_options)
-        virtual_ids = {
-            camera.id for camera in camera_options if is_virtual_camera_name(camera.name)
-        }
-        logged_virtual_skips: set[int] = set()
-        prefer_physical = bool(requested_label) and not is_virtual_camera_name(requested_label)
 
         def add(candidate_id: int) -> None:
             if candidate_id < 0 or candidate_id in candidates:
-                return
-            if prefer_physical and candidate_id in virtual_ids:
-                if candidate_id not in logged_virtual_skips:
-                    self.logger.log(
-                        f"Skipping virtual camera slot {candidate_id} for {requested_label}"
-                    )
-                    logged_virtual_skips.add(candidate_id)
                 return
             candidates.append(candidate_id)
 
@@ -1769,13 +1785,16 @@ class SingleWindowGazeCorrector:
 
             has_frame = False
             best_metrics: tuple[bool, float, float, float, float] | None = None
-            for _ in range(10):
+            probe_frames = 60 if require_live_frame else 20
+            for _ in range(probe_frames):
                 ret, test_frame = cap.read()
                 if ret and test_frame is not None:
                     has_frame = True
                     metrics = self._frame_live_metrics(test_frame)
                     if best_metrics is None or metrics[1] > best_metrics[1]:
                         best_metrics = metrics
+                    if require_live_frame and metrics[0]:
+                        break
                 time.sleep(0.025)
             if not has_frame:
                 cap.release()
@@ -1811,6 +1830,7 @@ class SingleWindowGazeCorrector:
         label = requested_label or self._camera_label_overrides.get(preferred_id, "")
         allow_fallback = allow_remap and (not label or not is_virtual_camera_name(label))
         candidates = self._camera_candidate_ids(preferred_id, label) if allow_fallback else [preferred_id]
+        deferred_virtual_slots: list[tuple[int, str]] = []
 
         for candidate_id in candidates:
             candidate_label = self._camera_label_overrides.get(
@@ -1818,10 +1838,7 @@ class SingleWindowGazeCorrector:
                 camera_name(candidate_id, self._all_camera_options or self.camera_options),
             )
             if label and not is_virtual_camera_name(label) and is_virtual_camera_name(candidate_label):
-                self.logger.log(
-                    f"Skipping virtual camera slot {candidate_id} ({candidate_label}) "
-                    f"for requested physical camera {label}"
-                )
+                deferred_virtual_slots.append((candidate_id, candidate_label))
                 continue
             cap = self._open_camera_capture_direct(candidate_id, require_live_frame=True)
             if cap is not None:
@@ -1833,21 +1850,23 @@ class SingleWindowGazeCorrector:
                     )
                 return cap, candidate_id
 
-        preferred_label = self._camera_label_overrides.get(
-            preferred_id,
-            camera_name(preferred_id, self._all_camera_options or self.camera_options),
-        )
-        if label and not is_virtual_camera_name(label) and is_virtual_camera_name(preferred_label):
-            self.logger.log(
-                f"Not falling back to virtual camera slot {preferred_id} "
-                f"({preferred_label}) for requested physical camera {label}"
-            )
-            return None, preferred_id
+        if label and not is_virtual_camera_name(label):
+            for candidate_id, candidate_label in deferred_virtual_slots:
+                self.logger.log(
+                    f"Probing slot {candidate_id} ({candidate_label}) as a last chance "
+                    f"for requested physical camera {label}"
+                )
+                cap = self._open_camera_capture_direct(candidate_id, require_live_frame=True)
+                if cap is None:
+                    continue
+                pretty_label = self._short_label(label or f"Camera {preferred_id}", 28)
+                self._set_camera_status(f"{pretty_label} opened on slot #{candidate_id}", 3.0)
+                self.logger.log(
+                    f"Camera slot remapped through live-frame probe: requested {preferred_id}, opened {candidate_id}"
+                )
+                return cap, candidate_id
 
-        cap = self._open_camera_capture_direct(preferred_id, require_live_frame=False)
-        if cap is not None:
-            self._set_camera_status("Camera opened, but image looks dark", 3.0)
-            return cap, preferred_id
+        self._set_camera_status("No live camera frame", 3.0)
 
         return None, preferred_id
 
@@ -1910,42 +1929,25 @@ class SingleWindowGazeCorrector:
         """Try the physical stream again instead of falling into virtual camera slots."""
         self.logger.log(f"{reason}; looking for another live camera slot")
         stream.release()
-        with self._camera_refresh_lock:
-            camera_options = list(self._all_camera_options or self.camera_options)
 
-        prefer_physical = not is_virtual_camera_name(self.camera_label)
-        candidates = self._camera_candidate_ids(self.camera_id, self.camera_label)
-        for camera in sorted(camera_options, key=lambda item: (is_virtual_camera_name(item.name), item.id)):
-            if prefer_physical and is_virtual_camera_name(camera.name):
-                self.logger.log(
-                    f"Skipping virtual recovery slot {camera.id} ({camera.name})"
-                )
-                continue
-            if camera.id not in candidates:
-                candidates.append(camera.id)
-
-        for candidate_id in candidates:
-            recovered_label = self._camera_label_overrides.get(
-                candidate_id,
-                camera_name(candidate_id, self._all_camera_options or self.camera_options),
+        previous_id = self.camera_id
+        requested_label = self.camera_label
+        cap, actual_camera_id = self._open_camera_capture(
+            self.camera_id,
+            requested_label,
+            allow_remap=True,
+        )
+        if cap is not None:
+            self.camera_id = actual_camera_id
+            self.camera_label = requested_label or camera_name(
+                self.camera_id,
+                self._all_camera_options or self.camera_options,
             )
-            if prefer_physical and is_virtual_camera_name(recovered_label):
-                self.logger.log(
-                    f"Skipping virtual recovery slot {candidate_id} ({recovered_label})"
-                )
-                continue
-            cap = self._open_camera_capture_direct(candidate_id, require_live_frame=True)
-            if cap is None:
-                continue
-
-            previous_id = self.camera_id
-            self.camera_id = candidate_id
-            self.camera_label = recovered_label
-            self._remember_camera_label(candidate_id, self.camera_label)
+            self._remember_camera_label(self.camera_id, self.camera_label)
             if not is_virtual_camera_name(self.camera_label):
-                save_camera_id(candidate_id, self.camera_label)
-            self._set_camera_status(f"Recovered camera on slot #{candidate_id}", 3.0)
-            self.logger.log(f"Recovered camera stream: {previous_id} -> {candidate_id}")
+                save_camera_id(self.camera_id, self.camera_label)
+            self._set_camera_status(f"Recovered camera on slot #{self.camera_id}", 3.0)
+            self.logger.log(f"Recovered camera stream: {previous_id} -> {self.camera_id}")
             self.gaze_corrector.reset_tracking()
             return CameraFrameStream(cap, self.logger)
 
@@ -1971,6 +1973,7 @@ class SingleWindowGazeCorrector:
 
         failed_reads = 0
         last_frame_id = 0
+        blank_frame_streak = 0
         while True:
             self.process_control_command()
             self.apply_pending_window_actions()
@@ -1992,6 +1995,7 @@ class SingleWindowGazeCorrector:
                     stream = recovered
                     failed_reads = 0
                     last_frame_id = 0
+                    blank_frame_streak = 0
                     continue
                 break
             if frame_id == last_frame_id:
@@ -2002,12 +2006,28 @@ class SingleWindowGazeCorrector:
                         stream = recovered
                         failed_reads = 0
                         last_frame_id = 0
+                        blank_frame_streak = 0
                         continue
                     break
                 time.sleep(0.003)
                 continue
             last_frame_id = frame_id
             failed_reads = 0
+            if self._frame_looks_blank(frame):
+                blank_frame_streak += 1
+                if blank_frame_streak == 1:
+                    self.logger.log("Camera is returning blank placeholder frames")
+                if blank_frame_streak > 75:
+                    recovered = self._recover_camera_stream(stream, "Camera returned blank frames")
+                    if recovered is not None:
+                        stream = recovered
+                        failed_reads = 0
+                        last_frame_id = 0
+                        blank_frame_streak = 0
+                        continue
+                    blank_frame_streak = 0
+            else:
+                blank_frame_streak = 0
             frame = self._prepare_pipeline_frame(frame)
             self._update_video_size_from_frame(frame)
 
