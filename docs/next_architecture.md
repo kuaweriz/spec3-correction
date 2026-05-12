@@ -1,40 +1,29 @@
-# Next Architecture: Stable Reading Gaze
+# Next Architecture: Iris Retargeting
 
-The current app is based on eye-region warping. It can redirect gaze, but it
-does not truly control the pupil as a separate object. When the user reads
-text, the real iris moves inside the source crop. A warp model can compensate
-some of that movement, but it will still leak fast reading saccades.
+The next major improvement should focus on realistic iris retargeting instead of stronger sliders. The current transformation path can stabilize reading motion, but it still receives an eye crop where the real iris is already moving. That is why fast reading movement, blinks, and strong downward direction can still create visible artifacts.
 
-## Why the Current Approach Jitters
+## Direction
 
-- The input eye crop already contains the moving pupil.
-- Landmark and iris tracking noise changes the correction angle every frame.
-- DeepWarp generates a corrected eye from the current crop, so reading motion
-  can remain visible even after angle smoothing.
-- Freezing or blending previous eye patches looks fake because the head and
-  eyelids keep moving while the old eye texture stays behind.
+Split eye rendering into three jobs:
 
-## Better Direction
+1. Track eyelids and eye shape.
+2. Estimate a stable target for READ mode.
+3. Rebuild the iris and nearby sclera inside the valid eye area with temporal consistency.
 
-The next version should separate three jobs:
+This should make the result less dependent on the original moving iris and less likely to show a visible overlay.
 
-1. Face and eyelid tracking.
-2. Stable target gaze estimation.
-3. Eye synthesis/inpainting that places the iris at the stable target while
-   preserving eyelids, lighting, blink state, and eye shape.
+## Requirements
 
-That means the stable-reading version needs a dedicated eye synthesis module,
-not just more UI sliders. Good candidates:
+- READ mode hides fast horizontal reading movement.
+- LIVE mode keeps natural movement and side glances.
+- A blink must never reveal a second iris during eye opening.
+- Strong downward direction should remain inside the eyelids.
+- Small slow motion should remain so the eyes do not look dead.
+- The user should control only simple settings: strength, vertical direction, hold, smoothness, and eye life.
 
-- train or fine-tune an eye-only generator for iris relocation;
-- use segmentation/inpainting around iris and sclera with temporal consistency;
-- use a modern face/eye reenactment model and drive it with a stable gaze target;
-- keep the old DeepWarp path only as a fallback.
+## Candidate Approaches
 
-## Product Requirements
-
-- Reading text should not show fast horizontal saccades.
-- Small slow motion should remain, so the gaze does not look dead.
-- The user should control only simple settings: strength, eyes up/down,
-  stabilizer, smoothness, and live look.
-- Exit must work independently of OpenCV window focus.
+- Eye-only segmentation with iris replacement and inpainting.
+- Small personalized model trained on the user's own eye examples.
+- Temporal iris tracker that clamps the output to the visible eye mask.
+- Existing transformation path as a fallback for low-confidence frames.

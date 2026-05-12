@@ -1,327 +1,110 @@
-# Architecture & Module Documentation
+# spec3 correction Architecture
 
-> Developer reference for the spec3 correction system.
-> For user-facing setup and usage, see the [README](../README.md).
+Developer reference for the current macOS app. For user-facing setup and usage, see the main README.
 
-## System Overview
+## Product Goal
 
-This is a **real-time gaze correction system** that redirects eye gaze in video streams to create natural eye contact during video calls. The system uses face detection, facial landmarks, and deep learning models to warp eye regions.
+spec3 correction is built around reading stabilization. The app should reduce visible reading motion in the eyes while keeping enough subtle movement that the result does not look frozen or artificial.
 
-## File Structure & Module Organization
+The current product priorities are:
 
-### 1. Entry Points (bin\_\*.py)
+- stable READ detection;
+- realistic eye-region rendering;
+- smooth camera preview performance;
+- predictable camera selection;
+- simple controls for strength, vertical direction, hold, smoothness, and eye life;
+- Personal AI training that persists between app launches.
 
-#### bin_single_window.py ⭐ *Main Application*
+## Runtime Flow
 
-- **Purpose**: Single-window gaze correction app with real-time controls
-- **Features**:
-  - Auto-detects camera resolution
-  - Toggle gaze correction on/off (`g` key)
-  - Calibration mode for camera offset adjustment (`c` key)
-  - Supports multiple backends (dlib/MediaPipe)
-- **Flow**: `Camera Input → FacePredictor → GazeCorrector → Display Output`
-
-#### bin_focal_length_calibration.py
-
-- Standalone tool for camera focal length calibration
-
-#### bin_test_mediapipe_detection.py
-
-- Test utility for MediaPipe face detection
-
-### 2. Core Modules (displayers/)
-
-The `displayers/` directory contains the main business logic components:
-
-#### face_predictor.py — Face Detection & Landmark Extraction
-
-**Purpose**: Abstract interface for face detection backends
-
-**Key Classes**:
-
-- `FacePredictor` (ABC): Interface for face detection
-- `DlibFacePredictor`: Implementation using dlib (68 landmarks)
-- `MediaPipeFacePredictor`: Implementation using Google MediaPipe
-- Data classes: `FaceData`, `EyeData`, `EyeLandmarks`
-
-**Process**: `Input Frame → Face Detection → Landmark Prediction → Eye Extraction → EyeData`
-
-**Output**: `FaceData` containing:
-
-- Left/right eye images (normalized 48×64)
-- Anchor maps (feature point maps for spatial guidance)
-- Eye center coordinates
-- Original positions in frame
-
-#### gaze_corrector.py — Gaze Correction Model
-
-**Purpose**: Wraps TensorFlow models for eye gaze correction
-
-**Key Classes**:
-
-- `GazeModel`: TensorFlow model wrapper (loads L/R eye models)
-- `GazeCorrector`: High-level interface for gaze correction
-- `CameraConfig`: Camera geometry (focal length, IPD, camera offset)
-
-**Process**:
-
-```
-EyeData + Camera Geometry → TF Model Inference → Warped Eye Image
-                          ↓
-                    Angle Calculation (3D geometry)
+```text
+Camera input
+  -> camera selection and capture guard
+  -> face and eye tracking
+  -> READ / LIVE / LOOK state estimation
+  -> eye stabilization target
+  -> eye-region model and blend
+  -> single-window preview and controls
 ```
 
-**Components**:
+## Main Areas
 
-1. **Model Loading**: Loads separate L/R eye TensorFlow models from `weights/`
-2. **Angle Calculation**: Computes gaze redirection angle based on:
-   - Eye position in 3D space
-   - Camera position relative to screen
-   - Target gaze direction (toward camera)
-3. **Eye Warping**: Applies learned transformation to redirect gaze
+### App Window
 
-**Camera Geometry**:
+`displayers/dis_single_window.py` owns the combined preview and control panel. It is responsible for:
 
-- `focal_length`: Camera focal length (pixels)
-- `ipd`: Inter-pupillary distance (cm)
-- `camera_offset`: Camera position (X, Y, Z) relative to screen center
+- the main preview frame;
+- control panel layout;
+- camera picker;
+- settings, logs, training, hide, reset, and quit actions;
+- keeping UI actions responsive even while frames are being processed.
 
-#### dis_single_window.py — Application Orchestrator
+### Camera Layer
 
-**Purpose**: Main application logic coordinating all components
+The camera layer should always prefer real available cameras and avoid stale virtual devices. The picker displays the selected slot so the user can verify what is active.
 
-**Key Class**: `SingleWindowGazeCorrector`
+Important behavior:
 
-**Responsibilities**:
+- refresh devices before opening the menu;
+- keep the selected camera stable by slot and name;
+- release the previous capture before opening a new one;
+- show a clear inactive preview when the camera cannot be opened;
+- avoid leaving a camera session locked after quit or hide.
 
-1. Camera capture and frame processing
-2. FacePredictor → GazeCorrector pipeline
-3. Real-time toggle controls
-4. Calibration mode UI
-5. Composite frame rendering
+### Eye Tracking
 
-**Pipeline**:
+`displayers/face_predictor.py` extracts face and eye data from each frame. It provides normalized eye crops, landmarks, eye centers, and placement data for compositing.
 
-```
-Camera Frame
-    ↓
-Resize for Face Detection (320×240)
-    ↓
-FacePredictor.list_eye_data()
-    ↓
-For each eye:
-    - If gaze_enabled: GazeCorrector.correct_eye()
-    - Else: Use original eye image
-    ↓
-Composite corrected eyes onto original frame
-    ↓
-Draw status overlay
-    ↓
-Display in window
-```
+The rest of the app depends on these values being temporally stable. Any noisy landmark jump can become a visible eye artifact, so smoothing and validity checks belong close to this layer.
 
-### 3. TensorFlow Models (tf_models/)
+### Eye Stabilization
 
-#### flx.py — FLX Model Architecture
+`displayers/gaze_corrector.py` is the existing low-level model wrapper. The product layer treats it as an eye-region transformation module.
 
-**Purpose**: Defines the neural network architecture for gaze correction
+The stabilizer should:
 
-**Key Components**:
+- keep the iris inside the eye shape;
+- respect eyelids and blink state;
+- avoid showing a second iris when the eye opens after a blink;
+- clamp extreme directions before they create obvious artifacts;
+- blend only inside a reliable eye mask;
+- preserve color, contrast, and lighting from the source frame.
 
-- `encoder()`: Encodes gaze angle into spatial feature map
-- `trans_module()`: Transformation module with skip connections
-- `apply_lcm()`: Light color modulation for realistic rendering
-- `inference()`: Main forward pass combining all components
+### READ Detector
 
-**Architecture**:
+The READ detector decides when reading stabilization should be strong. It combines current motion features, recent history, and the optional Personal AI model.
 
-```
-Eye Image + Anchor Map + Angle
-    ↓
-[Feature Extraction CNN]
-    ↓
-[Angle Encoder] → Spatial Feature Map
-    ↓
-[Transformation Module (Dense CNN)]
-    ↓
-[Flow Field Generation]
-    ↓
-[Spatial Transformer] → Warped Image
-    ↓
-[Light Color Modulation]
-    ↓
-Corrected Eye Image
-```
+Expected behavior:
 
-#### transformation.py — Spatial Transformer
+- reading text should enter READ quickly;
+- a single side glance should stay LIVE;
+- READ should not latch onto a corner after a normal glance;
+- transitions should be smooth, not delayed by multiple seconds;
+- Personal AI should improve behavior without resetting after every launch.
 
-**Purpose**: Implements differentiable image warping
+### Personal AI Training
 
-**Key Functions**:
+Training records examples for:
 
-- `meshgrid()`: Generates coordinate grid
-- `interpolate()`: Bilinear interpolation for smooth warping
-- `apply_transformation()`: Applies flow field to warp image
+- `READ`: the user reads normal text in the usual screen position;
+- `LIVE`: the user looks normally at the camera or central screen area;
+- `LOOK`: the user makes natural side glances and casual eye movement.
 
-**Used for**: Applying learned pixel displacement fields to eye images
+Training data is temporary for the current session, while the trained model is saved for future app launches. New training should improve the saved model without making the UI unclear.
 
-#### tf_utils.py
+### Logs
 
-- Common TensorFlow utilities
-- CNN/DNN blocks with batch normalization
+The logs window is for readable diagnostics, not raw noise. It should make startup, camera choice, model loading, training, and errors understandable without forcing the user to inspect terminal output.
 
-### 4. Utilities (utils/)
+## Quality Rules
 
-#### config.py — Configuration Management
+- The app should never show a black preview silently; it needs an inactive state and a useful log entry.
+- Buttons must work regardless of OpenCV focus.
+- Camera switching should feel instant and deterministic.
+- Training should give countdown and completion signals.
+- Extreme eye direction values should degrade gracefully instead of creating obvious overlays.
+- UI text should remain readable in both dark and light themes.
 
-**Purpose**: Centralized configuration using argparse
+## Future Work
 
-**Parameters**:
-
-- Model dimensions (height=48, width=64, ef_dim=12)
-- Camera parameters (focal length, IPD, camera offset)
-- Network settings (IP, ports for multi-process mode)
-
-#### logger.py — Logging Utility
-
-**Purpose**: Formatted logging with timestamps and thread IDs
-
-**Format**: `2026-01-27 10:30:45.123 Python[12345:67890] +[ClassName]: Message`
-
-## Data Flow Pipeline
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        MAIN APPLICATION                         │
-│                     (bin_single_window.py)                      │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │
-                       ↓
-         ┌─────────────────────────────┐
-         │   Camera Capture (OpenCV)   │
-         │   Original: 640×480         │
-         └─────────────┬───────────────┘
-                       │
-                       ↓
-         ┌─────────────────────────────┐
-         │  Resize for Detection       │
-         │  Downscaled: 320×240        │
-         └─────────────┬───────────────┘
-                       │
-                       ↓
-┌──────────────────────────────────────────────────────────────────┐
-│                    FACE DETECTION LAYER                          │
-│                  (displayers/face_predictor.py)                  │
-├──────────────────────────────────────────────────────────────────┤
-│  • Detect face(s) in frame                                       │
-│  • Predict 68 facial landmarks (dlib) OR                         │
-│  • Predict 478 landmarks (MediaPipe)                             │
-│  • Extract eye regions (6 points per eye)                        │
-│  • Resize eye images to 48×64                                    │
-│  • Generate anchor maps (landmark feature maps)                  │
-└─────────────┬────────────────────────────────────────────────────┘
-              │
-              ↓ Output: List[FaceData]
-              │
-┌─────────────────────────────────────────────────────────────────┐
-│  FaceData {                                                     │
-│    left_eye: EyeData {                                          │
-│      image: 48×64×3 (normalized)                                │
-│      anchor_map: 48×64×12 (feature points)                      │
-│      center: (x, y)                                             │
-│      top_left: (row, col)                                       │
-│    }                                                            │
-│    right_eye: EyeData {...}                                     │
-│  }                                                              │
-└─────────────┬───────────────────────────────────────────────────┘
-              │
-              ↓
-┌──────────────────────────────────────────────────────────────────┐
-│                   GAZE CORRECTION LAYER                          │
-│                 (displayers/gaze_corrector.py)                   │
-├──────────────────────────────────────────────────────────────────┤
-│  For each eye:                                                   │
-│    1. Calculate 3D eye position from landmarks                   │
-│    2. Compute gaze redirection angle (toward camera)             │
-│    3. Feed to TensorFlow model:                                  │
-│       • Eye image (48×64×3)                                      │
-│       • Anchor map (48×64×12)                                    │
-│       • Gaze angle (θx, θy)                                      │
-│    4. Model outputs warped eye image                             │
-└─────────────┬────────────────────────────────────────────────────┘
-              │
-              ↓
-┌──────────────────────────────────────────────────────────────────┐
-│                      TensorFlow MODEL                            │
-│                     (tf_models/flx.py)                           │
-├──────────────────────────────────────────────────────────────────┤
-│  [Encoder] → Angle to spatial feature map                        │
-│  [CNN Feature Extraction] → Image features                       │
-│  [Transformation Module] → Flow field prediction                 │
-│  [Spatial Transformer] → Apply warping                           │
-│  [Light Color Module] → Adjust lighting                          │
-└─────────────┬────────────────────────────────────────────────────┘
-              │
-              ↓ Corrected Eye Image (48×64×3)
-              │
-┌──────────────────────────────────────────────────────────────────┐
-│                    COMPOSITE & DISPLAY                           │
-│                (dis_single_window.py)                            │
-├──────────────────────────────────────────────────────────────────┤
-│  1. Resize corrected eyes back to original size                  │
-│  2. Paste onto original 640×480 frame at eye positions           │
-│  3. Draw status overlay (GAZE ON/OFF)                            │
-│  4. Draw calibration overlay (if enabled)                        │
-│  5. Display in OpenCV window                                     │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-## Key Design Patterns
-
-### 1. Dependency Injection
-
-- `FacePredictor` is injectable → easy to swap backends (dlib ↔ MediaPipe)
-- `GazeCorrector` is injectable → testable and modular
-
-### 2. Abstract Interface
-
-- `FacePredictor` is abstract base class
-- Implementations: `DlibFacePredictor`, `MediaPipeFacePredictor`
-
-### 3. Configuration Objects
-
-- Dataclasses for configuration (immutable, type-safe)
-- `DisplayConfig`, `CameraConfig`, `GazeModelConfig`, etc.
-
-### 4. Separation of Concerns
-
-- Face detection ≠ Gaze correction
-- Display logic ≠ Model inference
-- Configuration ≠ Business logic
-
-## Module Responsibilities
-
-| Module                | Input                      | Output           | Responsibility                    |
-| --------------------- | -------------------------- | ---------------- | --------------------------------- |
-| **face_predictor**    | Frame (BGR)                | `List[FaceData]` | Detect faces, extract eye regions |
-| **gaze_corrector**    | `FaceData` + Camera Config | Corrected frame  | Apply gaze correction model       |
-| **flx.py**            | Eye image + Anchor + Angle | Warped eye       | Neural network inference          |
-| **transformation.py** | Flow field + Image         | Warped image     | Spatial transformation            |
-| **dis_single_window** | Camera stream              | Display window   | Orchestrate pipeline, UI          |
-
-## How It Works (High-Level)
-
-1. **Capture** video frame from webcam
-2. **Detect** face and extract 68 facial landmarks
-3. **Extract** left/right eye regions (48×64 each)
-4. **Calculate** 3D eye position and required gaze angle
-5. **Inference** through trained CNN to generate warping flow field
-6. **Warp** eye image using spatial transformer
-7. **Composite** corrected eyes back onto original frame
-8. **Display** result in real-time
-
-The key innovation is the **learned warping transformation** that realistically redirects gaze while preserving eye appearance, lighting, and texture.
-
-## References
-
-The implementation is based on research in gaze correction techniques using warping-based convolutional neural networks.
+The current model path is still based on eye-region transformation. For a more realistic long-term result, the next generation should separate eyelid tracking, iris placement, and eye texture synthesis more explicitly. That would make downward looks, blinks, and head motion more reliable than simply warping the current crop.
