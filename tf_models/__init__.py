@@ -1,10 +1,9 @@
-"""
-TensorFlow Models Package for Gaze Correction
+"""TensorFlow models for spec3 correction.
 
-This package provides versioned gaze correction models.
+This package provides versioned eye-region stabilization models.
 
 Versions:
-    - gaze_corrector_v1: Initial DeepWarp-based gaze correction model
+    - gaze_corrector_v1: Initial DeepWarp-based eye-region model
 """
 
 # Import versioned models

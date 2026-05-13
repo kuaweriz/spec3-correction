@@ -1,19 +1,22 @@
 [project]
-name = "gaze-correction-cam"
+name = "spec3-correction"
 version = "0.1.0"
-description = ""
+description = "macOS reading stabilization camera app"
 authors = [
-    {name = "WangWilly",email = "s89667654@gmail.com"}
+    {name = "Stanislav"}
 ]
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.9,<3.13"
 dependencies = [
     "tensorflow (>=2.19.0,<3.0.0)",
-    "dlib (>=19.24.8,<20.0.0)",
     "opencv-python (>=4.11.0.86,<5.0.0.0)",
-    "pyobjc (>=11.0,<12.0)",
     "mediapipe (>=0.10.32,<0.11.0)",
     "pyyaml (>=6.0.3,<7.0.0)",
+]
+
+[project.optional-dependencies]
+dlib = [
+    "dlib (>=19.24.8,<20.0.0)",
 ]
 
 [tool.poetry]
@@ -25,4 +28,3 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.group.dev.dependencies]
 black = "^25.1.0"
-

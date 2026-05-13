@@ -658,14 +658,14 @@ class MediaPipeFacePredictor(FacePredictor):
 
 
 def create_face_predictor(
-    backend: str = "dlib",
+    backend: str = "mediapipe",
     predictor_path: Optional[str] = None,
 ) -> FacePredictor:
     """
     Factory function to create a face predictor.
 
     Args:
-        backend: "dlib" or "mediapipe"
+        backend: "mediapipe" or optional "dlib"
         predictor_path: Optional path to model file
 
     Returns:

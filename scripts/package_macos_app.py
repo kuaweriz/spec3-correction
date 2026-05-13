@@ -131,7 +131,7 @@ def write_info_plist(contents_dir: Path) -> None:
         "LSMinimumSystemVersion": "14.0",
         "LSArchitecturePriority": ["arm64"],
         "LSRequiresNativeExecution": True,
-        "NSCameraUsageDescription": "Camera access is needed for spec3 correction to correct gaze in real time.",
+        "NSCameraUsageDescription": "Camera access is needed for spec3 correction to stabilize the camera preview in real time.",
         "NSDesktopFolderUsageDescription": "Desktop access is only needed when loading this local app bundle.",
     }
     with (contents_dir / "Info.plist").open("wb") as f:

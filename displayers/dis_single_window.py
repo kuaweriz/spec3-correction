@@ -252,7 +252,7 @@ class SingleWindowGazeCorrector:
         self.calib_cfg = calibration_config or CalibrationConfig()
 
         # Initialize face predictor (injectable)
-        self.face_predictor = face_predictor or create_face_predictor("dlib")
+        self.face_predictor = face_predictor or create_face_predictor("mediapipe")
         self.logger.log(f"Using face predictor: {self.face_predictor.get_name()}")
 
         # Initialize gaze corrector (injectable)
@@ -764,6 +764,60 @@ class SingleWindowGazeCorrector:
             self.logger.log(f"Window canvas size set to {canvas_w}x{canvas_h}")
 
         return canvas
+
+    def _make_inactive_preview_frame(self, message: str) -> np.ndarray:
+        """Create a clean preview frame when no physical camera is producing video."""
+        width, height = self.display_cfg.video_size
+        width = max(width, 1280)
+        height = max(height, 720)
+        frame = np.full((height, width, 3), (11, 16, 22), dtype=np.uint8)
+        for y in range(height):
+            shade = int(42 * y / max(1, height - 1))
+            frame[y, :, 1] = np.clip(frame[y, :, 1] + shade, 0, 255)
+            frame[y, :, 2] = np.clip(frame[y, :, 2] + shade // 2, 0, 255)
+
+        center = (width // 2, height // 2 - 42)
+        icon_w = 128
+        icon_h = 72
+        x1 = center[0] - icon_w // 2
+        y1 = center[1] - icon_h // 2
+        x2 = center[0] + icon_w // 2
+        y2 = center[1] + icon_h // 2
+        icon_color = (184, 199, 208)
+        cv2.rectangle(frame, (x1, y1), (x2 - 28, y2), icon_color, -1, cv2.LINE_AA)
+        pts = np.array([[x2 - 28, center[1] - 22], [x2 + 20, y1 - 6], [x2 + 20, y2 + 6], [x2 - 28, center[1] + 22]])
+        cv2.fillConvexPoly(frame, pts, icon_color, cv2.LINE_AA)
+        cv2.line(frame, (x1 - 34, y2 + 34), (x2 + 42, y1 - 46), icon_color, 8, cv2.LINE_AA)
+
+        text = self.tr(message, "Нет live-кадра с физической камеры")
+        hint = self.tr(
+            "Choose another camera or close the app using the camera.",
+            "Выберите другую камеру или закройте приложение, которое держит камеру.",
+        )
+        text_w = self._measure_text(text, 28, True)[0]
+        hint_w = self._measure_text(hint, 15, False)[0]
+        self._draw_text(frame, text, (max(24, (width - text_w) // 2), center[1] + 92), 28, (238, 242, 246), bold=True)
+        self._draw_text(frame, hint, (max(24, (width - hint_w) // 2), center[1] + 126), 15, (160, 172, 184))
+        return frame
+
+    def _display_app_frame_and_get_key(self, display_frame: np.ndarray) -> int:
+        key = -1
+        if self.window_visible:
+            if not self._window_created:
+                self.create_settings_panel()
+            app_frame = self.compose_app_frame(display_frame)
+            cv2.imshow(self.display_cfg.window_name, app_frame)
+            self._apply_pending_window_resize()
+            try:
+                if cv2.getWindowProperty(self.display_cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    self.logger.log("Main window hidden")
+                    self.hide_window(already_closed=True)
+                    return -1
+            except cv2.error:
+                self.hide_window(already_closed=True)
+                return -1
+            key = cv2.waitKeyEx(1)
+        return key
 
     def _apply_pending_window_resize(self) -> None:
         if self._pending_window_resize_size is None or self._window_resize_retries <= 0:
@@ -1909,7 +1963,6 @@ class SingleWindowGazeCorrector:
         label = requested_label or self._camera_label_overrides.get(preferred_id, "")
         allow_fallback = allow_remap and (not label or not is_virtual_camera_name(label))
         candidates = self._camera_candidate_ids(preferred_id, label) if allow_fallback else [preferred_id]
-        deferred_virtual_slots: list[tuple[int, str]] = []
 
         for candidate_id in candidates:
             candidate_label = self._camera_label_overrides.get(
@@ -1917,7 +1970,10 @@ class SingleWindowGazeCorrector:
                 camera_name(candidate_id, self._all_camera_options or self.camera_options),
             )
             if label and not is_virtual_camera_name(label) and is_virtual_camera_name(candidate_label):
-                deferred_virtual_slots.append((candidate_id, candidate_label))
+                self.logger.log(
+                    f"Skipping virtual camera slot {candidate_id} ({candidate_label}) "
+                    f"while opening physical camera {label}"
+                )
                 continue
             cap = self._open_camera_capture_direct(
                 candidate_id,
@@ -1931,26 +1987,6 @@ class SingleWindowGazeCorrector:
                     self.logger.log(
                         f"Camera slot remapped: requested {preferred_id}, opened {candidate_id}"
                     )
-                return cap, candidate_id
-
-        if label and not is_virtual_camera_name(label):
-            for candidate_id, candidate_label in deferred_virtual_slots:
-                self.logger.log(
-                    f"Probing slot {candidate_id} ({candidate_label}) as a last chance "
-                    f"for requested physical camera {label}"
-                )
-                cap = self._open_camera_capture_direct(
-                    candidate_id,
-                    require_live_frame=True,
-                    reject_static_placeholder=True,
-                )
-                if cap is None:
-                    continue
-                pretty_label = self._short_label(label or f"Camera {preferred_id}", 28)
-                self._set_camera_status(f"{pretty_label} opened on slot #{candidate_id}", 3.0)
-                self.logger.log(
-                    f"Camera slot remapped through live-frame probe: requested {preferred_id}, opened {candidate_id}"
-                )
                 return cap, candidate_id
 
         self._set_camera_status("No live camera frame", 3.0)
@@ -1968,7 +2004,7 @@ class SingleWindowGazeCorrector:
         self._last_canvas_size = None
         self.logger.log(f"Video size updated to {frame_w}x{frame_h}")
 
-    def _apply_pending_camera_switch(self, stream: CameraFrameStream):
+    def _apply_pending_camera_switch(self, stream: Optional[CameraFrameStream]):
         if self._pending_camera_id is None:
             return stream
 
@@ -1997,7 +2033,8 @@ class SingleWindowGazeCorrector:
             self.refresh_camera_options(force=True, async_refresh=True)
             return stream
 
-        stream.release()
+        if stream is not None:
+            stream.release()
         self.camera_id = actual_camera_id
         self.camera_label = requested_label or camera_name(
             self.camera_id,
@@ -2046,14 +2083,15 @@ class SingleWindowGazeCorrector:
         self.logger.log(f"Starting camera {self.camera_id}...")
         cap, actual_camera_id = self._open_camera_capture(self.camera_id, self.camera_label)
         if cap is None:
-            self.logger.log(f"Could not open camera {self.camera_id}")
-            return
-        if actual_camera_id != self.camera_id:
-            self.camera_id = actual_camera_id
-        self._remember_camera_label(self.camera_id, self.camera_label)
-        if not is_virtual_camera_name(self.camera_label):
-            save_camera_id(self.camera_id, self.camera_label)
-        stream = CameraFrameStream(cap, self.logger)
+            self.logger.log(f"Could not open camera {self.camera_id}; keeping app open without live stream")
+            stream: Optional[CameraFrameStream] = None
+        else:
+            if actual_camera_id != self.camera_id:
+                self.camera_id = actual_camera_id
+            self._remember_camera_label(self.camera_id, self.camera_label)
+            if not is_virtual_camera_name(self.camera_label):
+                save_camera_id(self.camera_id, self.camera_label)
+            stream = CameraFrameStream(cap, self.logger)
 
         self.create_settings_panel()
         self.logger.log("Press 'g' to toggle gaze, 'c' for calibration, 'q' to hide")
@@ -2067,6 +2105,24 @@ class SingleWindowGazeCorrector:
             stream = self._apply_pending_camera_switch(stream)
             if self.should_quit:
                 break
+
+            if stream is None:
+                display_frame = self._make_inactive_preview_frame("No live physical camera frame")
+                key = self._display_app_frame_and_get_key(display_frame)
+                time.sleep(0.03)
+                key_ascii = key & 0xFF
+                if key_ascii == 27:
+                    break
+                elif key_ascii in (ord("q"), ord("Q")):
+                    self.request_hide_window()
+                elif key_ascii in (ord("g"), ord("G")):
+                    self.toggle_correction()
+                    self.logger.log(
+                        f"Gaze correction: {'enabled' if self.gaze_correction_enabled else 'disabled'}"
+                    )
+                elif key_ascii in (ord("c"), ord("C")):
+                    self.calibration_mode = not self.calibration_mode
+                continue
 
             frame_id, frame, frame_age, stream_failed_reads = stream.snapshot()
             if frame is None:
@@ -2084,7 +2140,11 @@ class SingleWindowGazeCorrector:
                     last_frame_id = 0
                     blank_frame_streak = 0
                     continue
-                break
+                stream = None
+                failed_reads = 0
+                last_frame_id = 0
+                blank_frame_streak = 0
+                continue
             if frame_id == last_frame_id:
                 if stream_failed_reads > 180 and frame_age > 4.0:
                     self.logger.log("Camera stream stopped returning fresh frames")
@@ -2095,7 +2155,11 @@ class SingleWindowGazeCorrector:
                         last_frame_id = 0
                         blank_frame_streak = 0
                         continue
-                    break
+                    stream = None
+                    failed_reads = 0
+                    last_frame_id = 0
+                    blank_frame_streak = 0
+                    continue
                 time.sleep(0.003)
                 continue
             last_frame_id = frame_id
@@ -2112,7 +2176,11 @@ class SingleWindowGazeCorrector:
                         last_frame_id = 0
                         blank_frame_streak = 0
                         continue
+                    stream = None
+                    failed_reads = 0
+                    last_frame_id = 0
                     blank_frame_streak = 0
+                    continue
             else:
                 blank_frame_streak = 0
             frame = self._prepare_pipeline_frame(frame)
@@ -2127,22 +2195,7 @@ class SingleWindowGazeCorrector:
             if self.calibration_mode:
                 self.draw_calibration_overlay(display_frame)
 
-            key = -1
-            if self.window_visible:
-                if not self._window_created:
-                    self.create_settings_panel()
-                app_frame = self.compose_app_frame(display_frame)
-                cv2.imshow(self.display_cfg.window_name, app_frame)
-                self._apply_pending_window_resize()
-                try:
-                    if cv2.getWindowProperty(self.display_cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
-                        self.logger.log("Main window hidden")
-                        self.hide_window(already_closed=True)
-                        continue
-                except cv2.error:
-                    self.hide_window(already_closed=True)
-                    continue
-                key = cv2.waitKeyEx(1)
+            key = self._display_app_frame_and_get_key(display_frame)
 
             key_ascii = key & 0xFF
             if key_ascii == 27:

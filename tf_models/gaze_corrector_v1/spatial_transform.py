@@ -1,9 +1,8 @@
-"""
-Spatial Transformation Module for Gaze Correction
+"""Spatial transformation module for spec3 correction.
 
 This module provides differentiable spatial transformation operations
 that warp images based on optical flow fields. It's used to apply
-learned deformations to eye images for gaze redirection.
+learned deformations to eye images for reading stabilization.
 
 Key concepts:
 - Flow field: Per-pixel displacement vectors (dx, dy)

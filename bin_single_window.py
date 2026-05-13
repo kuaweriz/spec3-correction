@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""
-SpecTree Camera Application
+"""spec3 correction camera application.
 
-SpecTree gaze correction implementation using a single window.
+Single-window reading stabilization preview with camera controls.
 
 Usage:
-    python bin_single_window.py                      # Use dlib backend
-    python bin_single_window.py --backend mediapipe  # Use mediapipe backend
+    python bin_single_window.py                      # Use MediaPipe backend
+    python bin_single_window.py --backend dlib       # Use optional dlib backend
     python bin_single_window.py --camera 1           # Use camera device 1
 
 Controls:
-    - 'g': Toggle gaze correction on/off
+    - 'g': Toggle stabilization on/off
     - 'c': Toggle calibration mode
     - 'q': Quit
 """
@@ -69,16 +68,16 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="SpecTree Camera",
+        description="spec3 correction camera",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Controls:
-  'g' - Toggle gaze correction on/off
+  'g' - Toggle stabilization on/off
   'c' - Toggle calibration mode
   'q' - Quit the application
 
 Examples:
-  %(prog)s                         # Use default dlib backend
+  %(prog)s                         # Use default MediaPipe backend
   %(prog)s --backend mediapipe     # Use MediaPipe for face detection
   %(prog)s --camera 1              # Use camera device 1
         """,
@@ -86,9 +85,9 @@ Examples:
     parser.add_argument(
         "--backend",
         type=str,
-        default="dlib",
+        default="mediapipe",
         choices=["dlib", "mediapipe"],
-        help="Face detection backend (default: dlib)",
+        help="Face detection backend (default: mediapipe)",
     )
     parser.add_argument(
         "--camera",
