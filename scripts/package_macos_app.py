@@ -13,8 +13,6 @@ from pathlib import Path
 APP_NAME = "spec3 correction"
 BUNDLE_ID = "local.spec3-correction"
 APP_VERSION = "1.2.0"
-LEGACY_APP_NAMES = ("Gaze Correction Camera", "SpecTree")
-LEGACY_STOP_APP_NAMES = ("Stop Gaze Correction Camera", "Stop SpecTree", "Stop spec3 correction")
 
 
 def make_icon_png(path: Path, size: int) -> None:
@@ -173,16 +171,6 @@ def main() -> None:
 
     if app_dir.exists():
         shutil.rmtree(app_dir)
-
-    for legacy_name in LEGACY_APP_NAMES:
-        legacy_dir = desktop_dir / f"{legacy_name}.app"
-        if legacy_dir.exists():
-            shutil.rmtree(legacy_dir)
-
-    for legacy_name in LEGACY_STOP_APP_NAMES:
-        legacy_dir = desktop_dir / f"{legacy_name}.app"
-        if legacy_dir.exists():
-            shutil.rmtree(legacy_dir)
 
     macos_dir.mkdir(parents=True)
     resources_dir.mkdir(parents=True)

@@ -397,9 +397,11 @@ class SingleWindowGazeCorrector:
             elif not self.camera_options:
                 self.camera_options = [CameraInfo(self.camera_id, f"Camera {self.camera_id}")]
 
-            active_name = camera_name(active_id, cameras) if cameras else f"Camera {active_id}"
-            has_physical = any(not is_virtual_camera_name(camera.name) for camera in cameras)
-            active_is_hidden_virtual = has_physical and is_virtual_camera_name(active_name)
+            active_name = self._camera_label_overrides.get(
+                active_id,
+                camera_name(active_id, cameras) if cameras else f"Camera {active_id}",
+            )
+            active_is_hidden_virtual = is_virtual_camera_name(active_name)
             if all(camera.id != active_id for camera in self.camera_options) and not active_is_hidden_virtual:
                 self.camera_options.append(CameraInfo(active_id, f"Camera {active_id}"))
                 self.camera_options = self._deduplicate_camera_options(self.camera_options, active_id)
@@ -412,10 +414,13 @@ class SingleWindowGazeCorrector:
                     self._camera_switching = True
                 active_id = physical.id
 
-            self.camera_label = self._camera_label_overrides.get(
-                active_id,
-                camera_name(active_id, self.camera_options),
-            )
+            if not self.camera_options and cameras:
+                self.camera_label = self.tr("No physical camera", "Нет физической камеры")
+            else:
+                self.camera_label = self._camera_label_overrides.get(
+                    active_id,
+                    camera_name(active_id, self.camera_options),
+                )
             self._camera_options_refreshed_at = time.monotonic()
             if refresh_finished:
                 self._camera_refreshing = False
@@ -476,7 +481,12 @@ class SingleWindowGazeCorrector:
             if existing.id == active_id:
                 continue
 
-        if active_label and all(camera.id != active_id for camera in cleaned):
+        active_key = self._camera_label_key(active_label) if active_label else ""
+        if (
+            active_label
+            and active_key not in seen
+            and all(camera.id != active_id for camera in cleaned)
+        ):
             cleaned.insert(0, CameraInfo(active_id, active_label))
         return cleaned
 
@@ -1826,7 +1836,26 @@ class SingleWindowGazeCorrector:
             and center_bright_ratio > 0.012
             and saturation < 92.0
         )
-        return skin_ratio < 0.012 and has_idle_card_shape
+        static_logo_card = (
+            temporal_delta < 0.18
+            and skin_ratio < 0.018
+            and dark_ratio > 0.22
+            and center_bright_ratio > 0.004
+            and (bright_ratio > 0.004 or std > 10.0)
+        )
+        return (skin_ratio < 0.012 and has_idle_card_shape) or static_logo_card
+
+    def _frame_looks_physical_probe(
+        self,
+        frame: np.ndarray,
+        temporal_delta: float,
+    ) -> bool:
+        """Accept a native-virtual slot only if it looks like a live physical camera."""
+        usable, _score, _mean, _std, _bright_ratio = self._frame_live_metrics(frame)
+        if not usable:
+            return False
+        skin_ratio = self._skin_pixel_ratio(frame)
+        return skin_ratio >= 0.018 or temporal_delta >= 0.55
 
     def _camera_candidate_ids(self, preferred_id: int, requested_label: str) -> list[int]:
         candidates: list[int] = []
@@ -1841,8 +1870,8 @@ class SingleWindowGazeCorrector:
         add(preferred_id)
 
         physical_first = sorted(
-            camera_options,
-            key=lambda camera: (is_virtual_camera_name(camera.name), camera.id),
+            (camera for camera in camera_options if not is_virtual_camera_name(camera.name)),
+            key=lambda camera: camera.id,
         )
         for camera in physical_first:
             add(camera.id)
@@ -1863,6 +1892,7 @@ class SingleWindowGazeCorrector:
         camera_id: int,
         require_live_frame: bool = True,
         reject_static_placeholder: bool = False,
+        reject_native_virtual_slot: bool = False,
     ):
         """Open one concrete OpenCV camera slot and verify it returns a live frame."""
         camera_id = self.camera_id if camera_id is None else camera_id
@@ -1945,6 +1975,19 @@ class SingleWindowGazeCorrector:
                 )
                 continue
 
+            if (
+                reject_native_virtual_slot
+                and best_frame is not None
+                and not self._frame_looks_physical_probe(best_frame, max_temporal_delta)
+            ):
+                cap.release()
+                self.logger.log(
+                    "Camera "
+                    f"{camera_id} is labeled virtual and did not look like a physical camera "
+                    f"(motion={max_temporal_delta:.3f}); trying another slot"
+                )
+                continue
+
             actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.logger.log(f"Camera {camera_id} opened with {backend_name} at {actual_w}x{actual_h}")
@@ -1969,16 +2012,19 @@ class SingleWindowGazeCorrector:
                 candidate_id,
                 camera_name(candidate_id, self._all_camera_options or self.camera_options),
             )
-            if label and not is_virtual_camera_name(label) and is_virtual_camera_name(candidate_label):
+            candidate_is_native_virtual = is_virtual_camera_name(candidate_label)
+            if label and not is_virtual_camera_name(label) and candidate_is_native_virtual:
                 self.logger.log(
-                    f"Skipping virtual camera slot {candidate_id} ({candidate_label}) "
-                    f"while opening physical camera {label}"
+                    f"Probing native-virtual slot {candidate_id} ({candidate_label}) "
+                    f"only as an OpenCV remap candidate for physical camera {label}"
                 )
-                continue
             cap = self._open_camera_capture_direct(
                 candidate_id,
                 require_live_frame=True,
                 reject_static_placeholder=bool(label and not is_virtual_camera_name(label)),
+                reject_native_virtual_slot=bool(
+                    label and not is_virtual_camera_name(label) and candidate_is_native_virtual
+                ),
             )
             if cap is not None:
                 if candidate_id != preferred_id:

@@ -172,17 +172,10 @@ def list_macos_cameras(force_refresh: bool = False) -> list[CameraInfo]:
         return list(_camera_cache)
 
     avfoundation_cameras = _list_cameras_from_avfoundation_file()
-    profiler_cameras = _list_cameras_from_json_profiler() or _list_cameras_from_text_profiler()
-    profiler_has_physical = any(
-        not is_virtual_camera_name(camera.name) for camera in profiler_cameras
-    )
-    avfoundation_has_physical = any(
-        not is_virtual_camera_name(camera.name) for camera in avfoundation_cameras
-    )
-    if profiler_cameras and (profiler_has_physical or not avfoundation_has_physical):
-        cameras = profiler_cameras
-    else:
+    if avfoundation_cameras:
         cameras = avfoundation_cameras
+    else:
+        cameras = _list_cameras_from_json_profiler() or _list_cameras_from_text_profiler()
     _camera_cache = cameras
     _camera_cache_time = now
     return list(cameras)
@@ -202,9 +195,9 @@ def is_virtual_camera_name(name: str) -> bool:
 
 
 def physical_camera_options(cameras: list[CameraInfo]) -> list[CameraInfo]:
-    """Hide virtual feedback cameras when at least one real camera is available."""
+    """Return only real cameras for user-facing selection."""
     physical = [camera for camera in cameras if not is_virtual_camera_name(camera.name)]
-    return physical or list(cameras)
+    return physical
 
 
 def choose_camera_id(requested_camera_id: int) -> int:
@@ -234,10 +227,11 @@ def choose_camera_id(requested_camera_id: int) -> int:
 
         if saved_camera_id is not None and saved_camera is not None and is_virtual_camera_name(saved_camera.name):
             print(
-                "Ignoring saved camera slot "
+                "Using saved OpenCV camera slot "
                 f"{saved_camera_id}: it was saved as {saved_camera_name}, "
                 f"but macOS now reports {saved_camera.name}"
             )
+            return saved_camera_id
 
         saved_by_name = next(
             (camera for camera in cameras if _camera_names_match(camera.name, saved_camera_name)),
@@ -265,6 +259,10 @@ def choose_camera_id(requested_camera_id: int) -> int:
 
     if not cameras:
         print("Could not list macOS cameras; using camera 0")
+        return 0
+
+    if not visible_cameras:
+        print("No physical cameras found in the macOS list; using camera 0")
         return 0
 
     print("Detected cameras:")
