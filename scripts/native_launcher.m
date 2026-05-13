@@ -466,6 +466,7 @@
     NSMutableDictionary *env = [[[NSProcessInfo processInfo] environment] mutableCopy];
     env[@"PYTHONUNBUFFERED"] = @"1";
     env[@"PYTHONNOUSERSITE"] = @"1";
+    env[@"PYTHONWARNINGS"] = @"ignore:urllib3 v2 only supports OpenSSL";
     env[@"MPLCONFIGDIR"] = self.cacheDir;
     env[@"GAZE_CONTROL_FILE"] = self.controlPath;
     env[@"SPEC3_NATIVE_REQUEST_FILE"] = self.nativeRequestPath;
