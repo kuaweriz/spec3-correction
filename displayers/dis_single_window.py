@@ -443,7 +443,7 @@ class SingleWindowGazeCorrector:
     ) -> list[CameraInfo]:
         cameras = physical_camera_options(cameras)
         options = [
-            CameraInfo(camera.id, self._camera_label_overrides.get(camera.id, camera.name))
+            camera.with_name(self._camera_label_overrides.get(camera.id, camera.name))
             for camera in cameras
         ]
         return self._deduplicate_camera_options(options, active_id)
@@ -465,11 +465,11 @@ class SingleWindowGazeCorrector:
             existing_index = seen.get(key)
             if existing_index is None:
                 seen[key] = len(cleaned)
-                cleaned.append(CameraInfo(camera.id, label))
+                cleaned.append(camera.with_name(label))
                 continue
 
             if camera.id == active_id:
-                cleaned[existing_index] = CameraInfo(camera.id, label)
+                cleaned[existing_index] = camera.with_name(label)
                 continue
 
             existing = cleaned[existing_index]
@@ -544,7 +544,7 @@ class SingleWindowGazeCorrector:
             updated_options: list[CameraInfo] = []
             for camera in self.camera_options:
                 if camera.id == camera_id:
-                    updated_options.append(CameraInfo(camera.id, clean_label))
+                    updated_options.append(camera.with_name(clean_label))
                     replaced = True
                 else:
                     updated_options.append(camera)
@@ -1726,6 +1726,54 @@ class SingleWindowGazeCorrector:
         usable, _score, mean, std, bright_ratio = self._frame_live_metrics(frame)
         return not usable and mean < 4.0 and std < 11.0 and bright_ratio < 0.025
 
+    def _skin_pixel_ratio(self, frame: np.ndarray) -> float:
+        """Estimate how much of a probe frame looks like live face skin."""
+        sample = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+        ycrcb = cv2.cvtColor(sample, cv2.COLOR_BGR2YCrCb)
+        y = ycrcb[:, :, 0]
+        cr = ycrcb[:, :, 1]
+        cb = ycrcb[:, :, 2]
+        skin_mask = (
+            (y > 35)
+            & (cr > 132)
+            & (cr < 182)
+            & (cb > 76)
+            & (cb < 138)
+        )
+        return float(np.mean(skin_mask))
+
+    def _frame_looks_virtual_idle_placeholder(
+        self,
+        frame: np.ndarray,
+        temporal_delta: float,
+    ) -> bool:
+        """Reject static virtual-camera idle cards while searching for a real camera."""
+        if temporal_delta > 0.35:
+            return False
+
+        sample = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)
+        mean = float(gray.mean())
+        std = float(gray.std())
+        dark_ratio = float(np.mean(gray < 42))
+        bright_ratio = float(np.mean(gray > 170))
+        center_bright_ratio = float(np.mean(gray[18:72, 34:126] > 148))
+        saturation = float(hsv[:, :, 1].mean())
+        skin_ratio = self._skin_pixel_ratio(frame)
+
+        has_idle_card_shape = (
+            dark_ratio > 0.34
+            and center_bright_ratio > 0.006
+            and std > 13.0
+        ) or (
+            mean < 96.0
+            and bright_ratio > 0.006
+            and center_bright_ratio > 0.012
+            and saturation < 92.0
+        )
+        return skin_ratio < 0.012 and has_idle_card_shape
+
     def _camera_candidate_ids(self, preferred_id: int, requested_label: str) -> list[int]:
         candidates: list[int] = []
         with self._camera_refresh_lock:
@@ -1756,7 +1804,12 @@ class SingleWindowGazeCorrector:
 
         return candidates
 
-    def _open_camera_capture_direct(self, camera_id: int, require_live_frame: bool = True):
+    def _open_camera_capture_direct(
+        self,
+        camera_id: int,
+        require_live_frame: bool = True,
+        reject_static_placeholder: bool = False,
+    ):
         """Open one concrete OpenCV camera slot and verify it returns a live frame."""
         camera_id = self.camera_id if camera_id is None else camera_id
         backends: list[tuple[str, int | None]] = []
@@ -1785,6 +1838,9 @@ class SingleWindowGazeCorrector:
 
             has_frame = False
             best_metrics: tuple[bool, float, float, float, float] | None = None
+            best_frame: np.ndarray | None = None
+            previous_probe: np.ndarray | None = None
+            max_temporal_delta = 0.0
             probe_frames = 60 if require_live_frame else 20
             for _ in range(probe_frames):
                 ret, test_frame = cap.read()
@@ -1793,6 +1849,16 @@ class SingleWindowGazeCorrector:
                     metrics = self._frame_live_metrics(test_frame)
                     if best_metrics is None or metrics[1] > best_metrics[1]:
                         best_metrics = metrics
+                        best_frame = test_frame.copy()
+                    probe = cv2.resize(
+                        cv2.cvtColor(test_frame, cv2.COLOR_BGR2GRAY),
+                        (96, 54),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    if previous_probe is not None:
+                        delta = float(cv2.absdiff(probe, previous_probe).mean())
+                        max_temporal_delta = max(max_temporal_delta, delta)
+                    previous_probe = probe
                     if require_live_frame and metrics[0]:
                         break
                 time.sleep(0.025)
@@ -1811,6 +1877,19 @@ class SingleWindowGazeCorrector:
                         f"(score={score:.1f}, mean={mean:.1f}, std={std:.1f}, bright={bright_ratio:.2f})"
                     )
                     continue
+
+            if (
+                reject_static_placeholder
+                and best_frame is not None
+                and self._frame_looks_virtual_idle_placeholder(best_frame, max_temporal_delta)
+            ):
+                cap.release()
+                self.logger.log(
+                    "Camera "
+                    f"{camera_id} looks like a static virtual-camera placeholder "
+                    f"(motion={max_temporal_delta:.3f}); trying another slot"
+                )
+                continue
 
             actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1840,7 +1919,11 @@ class SingleWindowGazeCorrector:
             if label and not is_virtual_camera_name(label) and is_virtual_camera_name(candidate_label):
                 deferred_virtual_slots.append((candidate_id, candidate_label))
                 continue
-            cap = self._open_camera_capture_direct(candidate_id, require_live_frame=True)
+            cap = self._open_camera_capture_direct(
+                candidate_id,
+                require_live_frame=True,
+                reject_static_placeholder=bool(label and not is_virtual_camera_name(label)),
+            )
             if cap is not None:
                 if candidate_id != preferred_id:
                     pretty_label = self._short_label(label or f"Camera {preferred_id}", 28)
@@ -1856,7 +1939,11 @@ class SingleWindowGazeCorrector:
                     f"Probing slot {candidate_id} ({candidate_label}) as a last chance "
                     f"for requested physical camera {label}"
                 )
-                cap = self._open_camera_capture_direct(candidate_id, require_live_frame=True)
+                cap = self._open_camera_capture_direct(
+                    candidate_id,
+                    require_live_frame=True,
+                    reject_static_placeholder=True,
+                )
                 if cap is None:
                     continue
                 pretty_label = self._short_label(label or f"Camera {preferred_id}", 28)

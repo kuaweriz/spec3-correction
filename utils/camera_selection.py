@@ -21,6 +21,11 @@ _camera_cache_time = 0.0
 class CameraInfo:
     id: int
     name: str
+    unique_id: str = ""
+    model_id: str = ""
+
+    def with_name(self, name: str) -> "CameraInfo":
+        return CameraInfo(self.id, name, self.unique_id, self.model_id)
 
 
 def _settings_path() -> Path:
@@ -97,7 +102,9 @@ def _list_cameras_from_json_profiler() -> list[CameraInfo]:
             continue
         name = _normalise_camera_name(str(item.get("_name", "")))
         if name and name.lower() != "camera":
-            cameras.append(CameraInfo(len(cameras), name))
+            unique_id = _normalise_camera_name(str(item.get("spcamera_unique-id", "")))
+            model_id = _normalise_camera_name(str(item.get("spcamera_model-id", "")))
+            cameras.append(CameraInfo(len(cameras), name, unique_id, model_id))
     return cameras
 
 
@@ -120,8 +127,10 @@ def _list_cameras_from_avfoundation_file() -> list[CameraInfo]:
             continue
         camera_id = item.get("id", index)
         name = _normalise_camera_name(str(item.get("name", "")))
+        unique_id = _normalise_camera_name(str(item.get("unique_id", "")))
+        model_id = _normalise_camera_name(str(item.get("model_id", "")))
         if isinstance(camera_id, int) and name:
-            cameras.append(CameraInfo(camera_id, name))
+            cameras.append(CameraInfo(camera_id, name, unique_id, model_id))
     return cameras
 
 
@@ -151,7 +160,7 @@ def _list_cameras_from_text_profiler() -> list[CameraInfo]:
 
 
 def list_macos_cameras(force_refresh: bool = False) -> list[CameraInfo]:
-    """Return camera names in the order OpenCV/AVFoundation usually uses."""
+    """Return camera names in the order OpenCV usually exposes on macOS."""
     global _camera_cache, _camera_cache_time
 
     now = time.monotonic()
@@ -164,20 +173,16 @@ def list_macos_cameras(force_refresh: bool = False) -> list[CameraInfo]:
 
     avfoundation_cameras = _list_cameras_from_avfoundation_file()
     profiler_cameras = _list_cameras_from_json_profiler() or _list_cameras_from_text_profiler()
-    if avfoundation_cameras:
-        avfoundation_has_physical = any(
-            not is_virtual_camera_name(camera.name) for camera in avfoundation_cameras
-        )
-        profiler_has_physical = any(
-            not is_virtual_camera_name(camera.name) for camera in profiler_cameras
-        )
-        cameras = (
-            avfoundation_cameras
-            if avfoundation_has_physical or not profiler_has_physical
-            else profiler_cameras
-        )
-    else:
+    profiler_has_physical = any(
+        not is_virtual_camera_name(camera.name) for camera in profiler_cameras
+    )
+    avfoundation_has_physical = any(
+        not is_virtual_camera_name(camera.name) for camera in avfoundation_cameras
+    )
+    if profiler_cameras and (profiler_has_physical or not avfoundation_has_physical):
         cameras = profiler_cameras
+    else:
+        cameras = avfoundation_cameras
     _camera_cache = cameras
     _camera_cache_time = now
     return list(cameras)
@@ -229,10 +234,10 @@ def choose_camera_id(requested_camera_id: int) -> int:
 
         if saved_camera_id is not None and saved_camera is not None and is_virtual_camera_name(saved_camera.name):
             print(
-                "Using saved physical camera slot "
-                f"{saved_camera_id} for {saved_camera_name}; native list currently labels it as {saved_camera.name}"
+                "Ignoring saved camera slot "
+                f"{saved_camera_id}: it was saved as {saved_camera_name}, "
+                f"but macOS now reports {saved_camera.name}"
             )
-            return saved_camera_id
 
         saved_by_name = next(
             (camera for camera in cameras if _camera_names_match(camera.name, saved_camera_name)),
