@@ -1,0 +1,67 @@
+<svg width="1280" height="420" viewBox="0 0 1280 420" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#070912"/>
+      <stop offset="0.44" stop-color="#15101f"/>
+      <stop offset="1" stop-color="#062c34"/>
+    </linearGradient>
+    <radialGradient id="violetGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(235 126) rotate(31) scale(330 230)">
+      <stop stop-color="#8E63FF" stop-opacity="0.72"/>
+      <stop offset="1" stop-color="#8E63FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cyanGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1000 318) rotate(-21) scale(360 250)">
+      <stop stop-color="#41D8F2" stop-opacity="0.52"/>
+      <stop offset="1" stop-color="#41D8F2" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="iris" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(642 210) rotate(90) scale(64)">
+      <stop offset="0" stop-color="#9CF7FF"/>
+      <stop offset="0.52" stop-color="#2EA2D7"/>
+      <stop offset="1" stop-color="#0E3E65"/>
+    </radialGradient>
+    <filter id="shadow" x="176" y="12" width="928" height="396" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="22" stdDeviation="26" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+    <filter id="soft" x="-40" y="-40" width="1360" height="500" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="420" rx="42" fill="url(#bg)"/>
+  <rect width="1280" height="420" rx="42" fill="url(#violetGlow)"/>
+  <rect width="1280" height="420" rx="42" fill="url(#cyanGlow)"/>
+
+  <g opacity="0.34" filter="url(#soft)">
+    <path d="M182 330C338 238 454 238 609 331" stroke="#7E5DFF" stroke-width="6"/>
+    <path d="M671 92C815 176 930 176 1099 96" stroke="#48E0F2" stroke-width="6"/>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="208" y="44" width="864" height="332" rx="48" fill="#111722" fill-opacity="0.72"/>
+    <rect x="209.5" y="45.5" width="861" height="329" rx="46.5" stroke="#CFEAFF" stroke-opacity="0.16" stroke-width="3"/>
+    <rect x="226" y="62" width="830" height="298" rx="36" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="2"/>
+  </g>
+
+  <g opacity="0.9">
+    <path d="M444 161H389V259H444" stroke="#8E63FF" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M836 161H891V259H836" stroke="#42DDEB" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <circle cx="640" cy="210" r="122" stroke="#CFEAFF" stroke-opacity="0.13" stroke-width="12"/>
+  <circle cx="640" cy="210" r="88" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="2"/>
+
+  <path d="M378 210C445 132 528 95 640 95C752 95 835 132 902 210C835 288 752 325 640 325C528 325 445 288 378 210Z" fill="#EDFBFF"/>
+  <path d="M378 210C445 132 528 95 640 95C752 95 835 132 902 210C835 288 752 325 640 325C528 325 445 288 378 210Z" fill="url(#cyanGlow)" opacity="0.18"/>
+  <circle cx="640" cy="210" r="70" fill="url(#iris)"/>
+  <circle cx="640" cy="210" r="34" fill="#051019"/>
+  <circle cx="612" cy="182" r="18" fill="white" fill-opacity="0.86"/>
+  <circle cx="640" cy="210" r="70" stroke="#02111A" stroke-opacity="0.35" stroke-width="5"/>
+
+  <g transform="translate(0 3)">
+    <circle cx="588" cy="352" r="8" fill="#8E63FF"/>
+    <circle cx="640" cy="352" r="8" fill="#42DDEB"/>
+    <circle cx="692" cy="352" r="8" fill="#FF9B45"/>
+  </g>
+
+  <text x="640" y="54" fill="#EAF6FF" fill-opacity="0.92" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="700" text-anchor="middle">spec3 correction</text>
+  <text x="640" y="393" fill="#B9C9D6" fill-opacity="0.82" font-family="Arial, Helvetica, sans-serif" font-size="20" text-anchor="middle">reading stabilization camera for calmer, more natural video presence</text>
+</svg>
