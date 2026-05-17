@@ -273,7 +273,7 @@ class PupilHoldFilter:
 
         previous_raw = self.smoothed_offsets[eye_side]
         raw_step = float(np.linalg.norm(raw - previous_raw))
-        raw_smooth_alpha = 0.22 + 0.24 * (1.0 - stabilizer_strength)
+        raw_smooth_alpha = 0.18 + 0.22 * (1.0 - stabilizer_strength)
         raw_smoothed = previous_raw * (1.0 - raw_smooth_alpha) + raw * raw_smooth_alpha
 
         stable = self.stable_offsets[eye_side]
@@ -297,16 +297,16 @@ class PupilHoldFilter:
         release_score = float(np.clip(release_score, 0.0, 1.0))
 
         # Strong stabilizer: ignore fast reading saccades, but follow sustained gaze shifts.
-        base_follow = 0.002 + ((1.0 - stabilizer_strength) ** 2) * 0.14
-        sustained_follow = max(0.0, (release_score - 0.55) / 0.45) * 0.32
+        base_follow = 0.0008 + ((1.0 - stabilizer_strength) ** 2) * 0.11
+        sustained_follow = max(0.0, (release_score - 0.62) / 0.38) * 0.18
         hard_follow = 0.0
-        if distance > 0.55:
-            hard_follow = min((distance - 0.55) * 0.45, 0.28)
-        follow_alpha = float(np.clip(base_follow + sustained_follow + hard_follow, 0.004, 0.42))
+        if distance > 0.64:
+            hard_follow = min((distance - 0.64) * 0.36, 0.22)
+        follow_alpha = float(np.clip(base_follow + sustained_follow + hard_follow, 0.0015, 0.34))
 
         new_stable = stable * (1.0 - follow_alpha) + raw_smoothed * follow_alpha
         delta = raw_smoothed - new_stable
-        deadband = 0.006 + 0.012 * (1.0 - stabilizer_strength)
+        deadband = 0.003 + 0.010 * (1.0 - stabilizer_strength)
         delta[np.abs(delta) < deadband] = 0.0
         delta = np.clip(delta, -0.70, 0.70)
 
@@ -434,6 +434,7 @@ class ReadingActivityDetector:
         self.active_until = 0.0
         self.release_until = 0.0
         self.last_release = 0.0
+        self.release_candidate_since = 0.0
         self.personal_learner = personal_learner
         self.last_personal_probability: float | None = None
         self.last_features: dict[str, float] = {}
@@ -445,6 +446,7 @@ class ReadingActivityDetector:
         self.active_until = 0.0
         self.release_until = 0.0
         self.last_release = 0.0
+        self.release_candidate_since = 0.0
 
     def update(
         self,
@@ -478,8 +480,24 @@ class ReadingActivityDetector:
         evidence, release = self._reading_evidence(now)
         if personal_probability is not None:
             evidence, release = self._blend_personal_probability(evidence, release, personal_probability)
+
+        protected_read = self.active or self.score > 0.16 or now < self.active_until
+        if release > 0.0:
+            if protected_read and evidence > 0.14:
+                release *= 0.22
+                self.release_candidate_since = 0.0
+            elif protected_read:
+                if self.release_candidate_since <= 0.0:
+                    self.release_candidate_since = now
+                if now - self.release_candidate_since < 0.18:
+                    release *= 0.28
+            else:
+                self.release_candidate_since = 0.0
+        else:
+            self.release_candidate_since = 0.0
+
         self.last_release = release
-        if release > 0:
+        if release > 0.42:
             self.release_until = max(self.release_until, now + 0.20 + 0.08 * release)
             self.active_until = 0.0
             self.score = min(self.score * (1.0 - 0.92 * release), 0.08)
@@ -490,23 +508,23 @@ class ReadingActivityDetector:
         if now < self.release_until:
             evidence *= 0.04
 
-        if evidence > 0.38:
-            self.active_until = max(self.active_until, now + 0.62)
+        if evidence > 0.30:
+            self.active_until = max(self.active_until, now + 0.84)
 
-        if evidence > 0.56:
-            rate = 0.86
-        elif evidence > 0.38:
-            rate = 0.74
+        if evidence > 0.50:
+            rate = 0.88
+        elif evidence > 0.30:
+            rate = 0.78
         else:
-            rate = 0.58 if evidence >= self.score else (0.18 if self.active else 0.38)
+            rate = 0.52 if evidence >= self.score else (0.11 if self.active else 0.28)
         self.score = float(np.clip(self.score * (1.0 - rate) + evidence * rate, 0.0, 1.0))
 
         if now < self.release_until:
             self.active = False
         elif self.active:
-            self.active = self.score > 0.11 or now < self.active_until
+            self.active = self.score > 0.085 or now < self.active_until
         else:
-            self.active = self.score > 0.22 or evidence > 0.46
+            self.active = self.score > 0.18 or evidence > 0.34
         return self.active, self.score
 
     def _blend_personal_probability(
@@ -599,7 +617,10 @@ class ReadingActivityDetector:
                 )
             )
         )
-        hard_glance_veto = directed_glance and not ai_read_motion
+        heuristic_read_motion = evidence >= 0.44 and not (
+            max_step > 0.070 and directness > 0.72 and bidirectional < 0.10
+        )
+        hard_glance_veto = directed_glance and not (ai_read_motion or heuristic_read_motion)
         if hard_glance_veto:
             evidence *= 0.08
             release = max(release, 0.82 if live_margin >= -0.05 else 0.62)
@@ -822,6 +843,27 @@ class ReadingActivityDetector:
         )
         side_zone = end_x_abs > 0.155 or mean_x_abs > 0.135
         center_zone = end_x_abs < 0.155 and mean_x_abs < 0.125
+        stable_vertical_guard = y_range < 0.170 and vertical_motion < 0.034
+        scan_return_guard = (
+            sign_changes >= 1
+            or recent_changes >= 1
+            or fresh_changes >= 1
+            or bidirectional_ratio > 0.055
+            or (x_range > 0.018 and path_direct_ratio < 0.78)
+        )
+        quick_read_scan = (
+            stable_vertical_guard
+            and small_step_count >= 2
+            and active_step_count >= 2
+            and active_ratio > 0.16
+            and active_span > 0.060
+            and total_horizontal_motion > 0.0075
+            and horizontal_motion > 0.00085
+            and max_step < 0.058
+            and median_active_step < 0.034
+            and scan_return_guard
+            and (center_zone or x_range > 0.034 or end_x_abs < 0.205)
+        )
 
         direct_jump = (
             max_step > 0.070
@@ -870,7 +912,7 @@ class ReadingActivityDetector:
                 and total_horizontal_motion < 0.260
             )
         )
-        if directed_glance:
+        if directed_glance and not quick_read_scan:
             return 0.0, 1.0
 
         meaningful_scan_range = x_range > 0.010 and total_horizontal_motion > 0.018
@@ -955,6 +997,7 @@ class ReadingActivityDetector:
         )
         read_like = (
             central_micro_read
+            or quick_read_scan
             or centered_read_pulse
             or sustained_center_scan
             or progressive_reading_scan
@@ -994,6 +1037,8 @@ class ReadingActivityDetector:
             evidence = max(evidence, 0.50)
         if central_micro_read:
             evidence = max(evidence, 0.50)
+        if quick_read_scan:
+            evidence = max(evidence, 0.47)
         if centered_read_pulse:
             evidence = max(evidence, 0.54)
         if sustained_center_scan:
@@ -1552,22 +1597,24 @@ class GazeCorrector:
         if release_active:
             target_hold = 0.0
             active = False
-            if self.hold_filter_value > 0.02:
-                self.pupil_hold_filter.reset()
-                self.eye_output_hold_filter.reset()
-            self.hold_filter_value = 0.0
         elif active:
-            intensity = np.clip((score - 0.035) / 0.245, 0.0, 1.0)
+            intensity = np.clip((score - 0.08) / 0.24, 0.0, 1.0)
             power = np.clip(self.tuning_settings.strength, 0.0, 1.5)
+            reading_power = np.clip(self.tuning_settings.reading_stabilizer * power, 0.0, 1.0)
             target_hold = float(
-                np.clip(self.tuning_settings.reading_stabilizer * power * intensity, 0.0, 1.0)
+                np.clip(reading_power * (0.74 + 0.26 * intensity), 0.0, 1.0)
             )
         else:
             target_hold = 0.0
 
         dt = max(1.0 / 120.0, min(now - self.hold_filter_time, 0.12))
         self.hold_filter_time = now
-        tau = 0.016 if target_hold >= self.hold_filter_value else 0.070
+        if target_hold >= self.hold_filter_value:
+            tau = 0.014
+        elif release_active:
+            tau = 0.090
+        else:
+            tau = 0.260 if self.last_effective_hold > 0.35 else 0.150
         alpha = 1.0 - math.exp(-dt / tau)
         hold = self.hold_filter_value * (1.0 - alpha) + target_hold * alpha
         self.hold_filter_value = float(np.clip(hold, 0.0, 1.0))
@@ -1579,7 +1626,7 @@ class GazeCorrector:
             if target_hold <= 0.001:
                 self.pupil_hold_filter.reset()
                 self.eye_output_hold_filter.reset()
-        self.last_reading_active = active
+        self.last_reading_active = active or hold > 0.22
         self.last_reading_score = score
         self.last_effective_hold = hold
         return hold
@@ -1610,6 +1657,16 @@ class GazeCorrector:
         motion_score = float(np.clip(motion_score, 0.0, 1.0))
 
         if motion_score > 0.0:
+            reading_protected = (
+                self.hold_filter_value > 0.22
+                or self.reading_detector.active
+                or now < self.reading_detector.active_until
+            )
+            if reading_protected and motion_score < 0.72:
+                self.motion_guard_strength = max(self.motion_guard_strength * 0.70, motion_score * 0.30)
+                self.reading_detector.active_until = max(self.reading_detector.active_until, now + 0.42)
+                return False
+
             self.motion_guard_until = max(self.motion_guard_until, now + 0.18 + 0.12 * motion_score)
             self.motion_guard_strength = max(self.motion_guard_strength * 0.78, motion_score)
             self.pupil_hold_filter.reset()
@@ -1678,8 +1735,8 @@ class GazeCorrector:
         if stabilizer <= 0.01:
             return delta
 
-        max_x = 0.128 + 0.045 * (1.0 - stabilizer)
-        max_y = 0.074 + 0.030 * (1.0 - stabilizer)
+        max_x = 0.158 + 0.042 * (1.0 - stabilizer)
+        max_y = 0.086 + 0.028 * (1.0 - stabilizer)
         limited = np.asarray(
             [
                 np.clip(delta[0], -max_x, max_x),
@@ -1687,7 +1744,7 @@ class GazeCorrector:
             ],
             dtype=np.float32,
         )
-        max_mag = 0.150 + 0.060 * (1.0 - stabilizer)
+        max_mag = 0.182 + 0.052 * (1.0 - stabilizer)
         mag = float(np.linalg.norm(limited))
         if mag > max_mag:
             limited *= max_mag / mag
@@ -2655,8 +2712,8 @@ class GazeCorrector:
             self._adaptive_reading_hold(le, re, le_closed, re_closed)
             return frame
 
-        motion_guard = self._face_motion_guard_active(le, re)
         hold_strength = self._adaptive_reading_hold(le, re, le_closed, re_closed)
+        motion_guard = self._face_motion_guard_active(le, re)
         manual_aim_active = self._manual_aim_active()
         if motion_guard or manual_aim_active:
             hold_strength = 0.0

@@ -11,6 +11,7 @@ spec3 correction is a macOS camera app focused on one practical job: making your
 - Lets you choose the input camera directly inside the app.
 - Supports manual vertical eye direction tuning for your monitor setup.
 - Includes Personal AI training for READ, LIVE, and LOOK behavior.
+- Can publish the corrected feed to video calls through OBS Virtual Camera.
 - Runs locally on your Mac.
 
 ## Requirements
@@ -18,6 +19,7 @@ spec3 correction is a macOS camera app focused on one practical job: making your
 - macOS 14 Sonoma or later.
 - Built-in MacBook camera or an external webcam.
 - Camera permission granted to the app.
+- OBS Studio if you want to use the corrected feed in Zoom, Meet, Yandex, Telegram, Discord, and similar apps.
 
 ## Getting Started
 
@@ -27,6 +29,7 @@ spec3 correction is a macOS camera app focused on one practical job: making your
 4. Turn the app `ON`.
 5. Adjust stabilization strength, vertical direction, hold, smoothness, and eye life until the look feels natural.
 6. Open the training window if you want the READ detector to adapt to your behavior.
+7. For video calls, open Settings and press `Start OBS Camera`, then select `OBS Virtual Camera` in the meeting app.
 
 ## Main Controls
 
@@ -43,6 +46,7 @@ spec3 correction is a macOS camera app focused on one practical job: making your
 | `Personal AI` | Opens the training window for custom READ/LIVE/LOOK examples. |
 | `Logs` | Opens a readable log window for diagnostics. |
 | `Settings` | Opens visual and language preferences. |
+| `Start OBS Camera` | Starts the OBS Bridge for video-conference apps. |
 | `Hide` | Hides the window while the app keeps running. |
 | `Quit` | Fully exits the app. |
 
@@ -62,6 +66,7 @@ After enough examples are collected, train the model from the same window. The a
 
 - If the preview is black, choose the correct camera from the camera menu and make sure no other app is holding the camera.
 - If the camera list looks stale, quit the app fully and reopen it after connecting or removing cameras.
+- If `OBS Virtual Camera` does not appear, approve OBS in `System Settings -> General -> Login Items & Extensions -> Camera Extensions`, then reopen the meeting app.
 - If READ mode feels wrong, collect fresh Personal AI examples in the same lighting and screen position you normally use.
 - If the eyes look too frozen, lower `Reading hold` or increase `Eye life`.
 - If the eyes move too much while reading, increase stabilization strength and `Reading hold`.

@@ -1,7 +1,11 @@
 #import <AVFoundation/AVFoundation.h>
 #import <Cocoa/Cocoa.h>
+#import <Security/Security.h>
+#import <SystemExtensions/SystemExtensions.h>
 
-@interface GazeAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+static NSString * const Spec3CameraExtensionIdentifier = @"local.spec3-correction.camera-extension";
+
+@interface GazeAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, OSSystemExtensionRequestDelegate>
 @property(nonatomic, strong) NSTask *task;
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSMenuItem *openItem;
@@ -63,8 +67,10 @@
 @property(nonatomic, strong) NSPopUpButton *fontPopup;
 @property(nonatomic, strong) NSPopUpButton *languagePopup;
 @property(nonatomic, strong) NSButton *settingsSaveButton;
+@property(nonatomic, strong) NSButton *virtualCameraInstallButton;
 @property(nonatomic, copy) NSString *projectPath;
 @property(nonatomic, copy) NSString *pythonPath;
+@property(nonatomic, copy) NSString *sitePackagesPath;
 @property(nonatomic, copy) NSString *scriptPath;
 @property(nonatomic, copy) NSString *logPath;
 @property(nonatomic, copy) NSString *cacheDir;
@@ -74,6 +80,7 @@
 @property(nonatomic, copy) NSString *trainingStatePath;
 @property(nonatomic, copy) NSString *preferencesPath;
 @property(nonatomic, copy) NSString *settingsDbPath;
+@property(nonatomic, strong) OSSystemExtensionRequest *systemExtensionRequest;
 @property(nonatomic, strong) NSTimer *nativeRequestTimer;
 @property(nonatomic) NSTimeInterval lastNativeRequestMTime;
 @property(nonatomic) BOOL isQuitting;
@@ -128,7 +135,16 @@
     NSBundle *bundle = [NSBundle mainBundle];
     NSString *resourcePath = [bundle resourcePath];
     self.projectPath = [resourcePath stringByAppendingPathComponent:@"project"];
-    self.pythonPath = [self.projectPath stringByAppendingPathComponent:@".venv/bin/python"];
+    NSString *pythonAppPath = @"/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python";
+    NSString *pythonToolPath = @"/Library/Developer/CommandLineTools/usr/bin/python3";
+    if ([[NSFileManager defaultManager] fileExistsAtPath:pythonAppPath]) {
+        self.pythonPath = pythonAppPath;
+    } else if ([[NSFileManager defaultManager] fileExistsAtPath:pythonToolPath]) {
+        self.pythonPath = pythonToolPath;
+    } else {
+        self.pythonPath = @"/usr/bin/python3";
+    }
+    self.sitePackagesPath = [self.projectPath stringByAppendingPathComponent:@".venv/lib/python3.9/site-packages"];
     self.scriptPath = [self.projectPath stringByAppendingPathComponent:@"bin_single_window.py"];
 
     NSString *home = NSHomeDirectory();
@@ -344,6 +360,10 @@
     settingsItem.target = self;
     [menu addItem:settingsItem];
 
+    NSMenuItem *virtualCameraItem = [[NSMenuItem alloc] initWithTitle:@"Start OBS Virtual Camera" action:@selector(startOBSBridge:) keyEquivalent:@""];
+    virtualCameraItem.target = self;
+    [menu addItem:virtualCameraItem];
+
     NSMenuItem *logsItem = [[NSMenuItem alloc] initWithTitle:@"Open Logs" action:@selector(openLogs:) keyEquivalent:@""];
     logsItem.target = self;
     [menu addItem:logsItem];
@@ -439,6 +459,26 @@
     }
 }
 
+- (void)runQuietTool:(NSString *)path arguments:(NSArray<NSString *> *)arguments {
+    @try {
+        NSTask *task = [[NSTask alloc] init];
+        task.launchPath = path;
+        task.arguments = arguments;
+        task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+        task.standardError = [NSFileHandle fileHandleWithNullDevice];
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *exception) {
+    }
+}
+
+- (void)resetCameraBrokerForFreshLaunch {
+    [self logLine:@"Resetting camera broker before launch"];
+    [self runQuietTool:@"/usr/bin/pkill" arguments:@[@"-f", @"bin_single_window.py"]];
+    [self runQuietTool:@"/usr/bin/killall" arguments:@[@"avconferenced"]];
+    [NSThread sleepForTimeInterval:0.45];
+}
+
 - (void)startCamera:(id)sender {
     if (self.task && self.task.isRunning) {
         [self sendCommand:@"show"];
@@ -447,11 +487,12 @@
         return;
     }
 
-    [self writeCameraList];
     if (![self cameraPermissionAllowed]) {
         [self enterMenuBarMode];
         return;
     }
+    [self resetCameraBrokerForFreshLaunch];
+    [self writeCameraList];
 
     [[NSFileManager defaultManager] removeItemAtPath:self.controlPath error:nil];
     self.stopRequested = NO;
@@ -466,6 +507,12 @@
     NSMutableDictionary *env = [[[NSProcessInfo processInfo] environment] mutableCopy];
     env[@"PYTHONUNBUFFERED"] = @"1";
     env[@"PYTHONNOUSERSITE"] = @"1";
+    if ([[NSFileManager defaultManager] fileExistsAtPath:self.sitePackagesPath]) {
+        NSString *existingPythonPath = env[@"PYTHONPATH"];
+        env[@"PYTHONPATH"] = existingPythonPath.length > 0
+            ? [NSString stringWithFormat:@"%@:%@", self.sitePackagesPath, existingPythonPath]
+            : self.sitePackagesPath;
+    }
     env[@"PYTHONWARNINGS"] = @"ignore:urllib3 v2 only supports OpenSSL";
     env[@"MPLCONFIGDIR"] = self.cacheDir;
     env[@"GAZE_CONTROL_FILE"] = self.controlPath;
@@ -1269,8 +1316,13 @@
     [self.languagePopup addItemWithTitle:@"Русский"];
     [content addSubview:self.languagePopup];
 
+    self.virtualCameraInstallButton = [NSButton buttonWithTitle:@"Start OBS Virtual Camera" target:self action:@selector(startOBSBridge:)];
+    self.virtualCameraInstallButton.frame = NSMakeRect(228, 108, 260, 34);
+    self.virtualCameraInstallButton.bezelStyle = NSBezelStyleRounded;
+    [content addSubview:self.virtualCameraInstallButton];
+
     self.settingsStatusLabel = [NSTextField labelWithString:@""];
-    self.settingsStatusLabel.frame = NSMakeRect(40, 102, 448, 42);
+    self.settingsStatusLabel.frame = NSMakeRect(40, 78, 448, 24);
     self.settingsStatusLabel.font = [self uiFontOfSize:13 weight:NSFontWeightRegular];
     self.settingsStatusLabel.maximumNumberOfLines = 2;
     [content addSubview:self.settingsStatusLabel];
@@ -1310,12 +1362,13 @@
     self.stylePopup.appearance = [self preferredAppearance];
     self.fontPopup.appearance = [self preferredAppearance];
     self.languagePopup.appearance = [self preferredAppearance];
+    self.virtualCameraInstallButton.appearance = [self preferredAppearance];
     self.settingsTitleLabel.stringValue = [self textEN:@"Settings" ru:@"Настройки"];
     self.settingsThemeLabel.stringValue = [self textEN:@"Theme" ru:@"Тема"];
     self.settingsStyleLabel.stringValue = [self textEN:@"Color style" ru:@"Стиль цвета"];
     self.settingsFontLabel.stringValue = [self textEN:@"Font" ru:@"Шрифт"];
     self.settingsLanguageLabel.stringValue = [self textEN:@"Language" ru:@"Язык"];
-    self.settingsStatusLabel.stringValue = [self textEN:@"Style and font update the main panel, training and settings windows." ru:@"Стиль и шрифт меняют главную панель, обучение и настройки."];
+    self.settingsStatusLabel.stringValue = [self textEN:@"OBS Bridge sends the corrected spec3 feed to OBS Virtual Camera." ru:@"OBS Bridge передаёт обработанный кадр spec3 в OBS Virtual Camera."];
     self.settingsTitleLabel.font = [self uiFontOfSize:26 weight:NSFontWeightBold];
     self.settingsThemeLabel.font = [self uiFontOfSize:15 weight:NSFontWeightSemibold];
     self.settingsStyleLabel.font = [self uiFontOfSize:15 weight:NSFontWeightSemibold];
@@ -1328,6 +1381,7 @@
     self.settingsFontLabel.textColor = [self primaryTextColor];
     self.settingsLanguageLabel.textColor = [self primaryTextColor];
     self.settingsStatusLabel.textColor = [self secondaryTextColor];
+    [self styleButton:self.virtualCameraInstallButton title:[self textEN:@"Start OBS Camera" ru:@"Запустить OBS Camera"] emphasized:NO];
     [self styleButton:self.settingsSaveButton title:[self textEN:@"Save" ru:@"Сохранить"] emphasized:YES];
 }
 
@@ -1345,6 +1399,146 @@
 
 - (void)openLogs:(id)sender {
     [self showLogWindow:sender];
+}
+
+- (void)startOBSBridge:(id)sender {
+    if (!(self.task && self.task.isRunning)) {
+        [self startCamera:nil];
+    }
+
+    NSString *scriptPath = [self.projectPath stringByAppendingPathComponent:@"script/start_obs_bridge.sh"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:scriptPath]) {
+        NSString *message = [NSString stringWithFormat:@"OBS Bridge script was not found: %@", scriptPath];
+        [self logLine:message];
+        [self showAlert:@"OBS Bridge is missing" message:message];
+        return;
+    }
+
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/bash";
+    task.arguments = @[scriptPath];
+    task.currentDirectoryPath = self.projectPath;
+    task.standardOutput = self.logHandle;
+    task.standardError = self.logHandle;
+    task.terminationHandler = ^(NSTask *finishedTask) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            int status = finishedTask.terminationStatus;
+            if (status == 0) {
+                [self logLine:@"OBS Bridge launched"];
+                if (self.settingsStatusLabel) {
+                    self.settingsStatusLabel.stringValue = [self textEN:@"OBS launched. Approve OBS Camera Extension once, then choose OBS Virtual Camera in Zoom." ru:@"OBS запущен. Один раз разрешите OBS Camera Extension, потом выберите OBS Virtual Camera в Zoom."];
+                }
+            } else {
+                [self logLine:[NSString stringWithFormat:@"OBS Bridge failed with status %d", status]];
+                if (self.settingsStatusLabel) {
+                    self.settingsStatusLabel.stringValue = [self textEN:@"OBS Bridge failed. Open Logs for details." ru:@"OBS Bridge не запустился. Откройте логи для деталей."];
+                }
+            }
+        });
+    };
+
+    @try {
+        [self logLine:@"Starting OBS Bridge"];
+        [task launch];
+        if (self.settingsStatusLabel) {
+            self.settingsStatusLabel.stringValue = [self textEN:@"Starting OBS Bridge..." ru:@"Запускаю OBS Bridge..."];
+        }
+    } @catch (NSException *exception) {
+        NSString *message = [NSString stringWithFormat:@"Could not launch OBS Bridge: %@", [exception reason]];
+        [self logLine:message];
+        [self showAlert:@"OBS Bridge could not start" message:message];
+    }
+}
+
+- (NSString *)virtualCameraExtensionPath {
+    NSString *systemExtensionsDir = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"Contents/Library/SystemExtensions"];
+    return [systemExtensionsDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.systemextension", Spec3CameraExtensionIdentifier]];
+}
+
+- (BOOL)hasSystemExtensionInstallEntitlement {
+    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+    if (!task) {
+        return NO;
+    }
+    CFTypeRef value = SecTaskCopyValueForEntitlement(task, CFSTR("com.apple.developer.system-extension.install"), nil);
+    CFRelease(task);
+    BOOL allowed = value == kCFBooleanTrue;
+    if (value) {
+        CFRelease(value);
+    }
+    return allowed;
+}
+
+- (void)installVirtualCamera:(id)sender {
+    NSString *extensionPath = [self virtualCameraExtensionPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:extensionPath]) {
+        NSString *message = [NSString stringWithFormat:@"Virtual camera extension was not found inside the app bundle: %@", extensionPath];
+        [self logLine:message];
+        [self showAlert:@"Virtual camera is missing" message:message];
+        return;
+    }
+
+    if (![self hasSystemExtensionInstallEntitlement]) {
+        NSString *message = @"This local build contains the virtual camera extension, but macOS will not install it without an Apple Developer provisioning profile that includes com.apple.developer.system-extension.install.";
+        [self logLine:message];
+        if (self.settingsStatusLabel) {
+            self.settingsStatusLabel.stringValue = [self textEN:@"Virtual camera requires Apple Developer system-extension signing." ru:@"Для виртуальной камеры нужна Apple Developer подпись с system-extension entitlement."];
+        }
+        [self showAlert:@"Developer signing required" message:message];
+        return;
+    }
+
+    if (@available(macOS 10.15, *)) {
+        [self logLine:[NSString stringWithFormat:@"Requesting virtual camera install: %@", Spec3CameraExtensionIdentifier]];
+        self.systemExtensionRequest = [OSSystemExtensionRequest activationRequestForExtension:Spec3CameraExtensionIdentifier
+                                                                                        queue:dispatch_get_main_queue()];
+        self.systemExtensionRequest.delegate = self;
+        [[OSSystemExtensionManager sharedManager] submitRequest:self.systemExtensionRequest];
+        if (self.settingsStatusLabel) {
+            self.settingsStatusLabel.stringValue = [self textEN:@"Installing virtual camera. macOS may ask for approval in System Settings." ru:@"Устанавливаю виртуальную камеру. macOS может попросить подтверждение в системных настройках."];
+        }
+    } else {
+        [self showAlert:@"Virtual camera is not supported"
+                message:@"CoreMediaIO camera extensions require macOS 10.15 or newer."];
+    }
+}
+
+- (OSSystemExtensionReplacementAction)request:(OSSystemExtensionRequest *)request
+                 actionForReplacingExtension:(OSSystemExtensionProperties *)existing
+                                withExtension:(OSSystemExtensionProperties *)ext {
+    [self logLine:[NSString stringWithFormat:@"Replacing virtual camera extension %@ -> %@", existing.bundleVersion, ext.bundleVersion]];
+    return OSSystemExtensionReplacementActionReplace;
+}
+
+- (void)requestNeedsUserApproval:(OSSystemExtensionRequest *)request {
+    NSString *message = @"macOS is waiting for approval. Open System Settings > Privacy & Security and allow the spec3 correction camera extension.";
+    [self logLine:message];
+    if (self.settingsStatusLabel) {
+        self.settingsStatusLabel.stringValue = [self textEN:@"macOS is waiting for approval in System Settings > Privacy & Security." ru:@"macOS ждёт подтверждение в Системных настройках > Конфиденциальность и безопасность."];
+    }
+    [self showAlert:@"Approve virtual camera"
+            message:@"Open System Settings > Privacy & Security and allow the spec3 correction camera extension. After approval, reopen Zoom/Meet/Yandex and choose “spec3 correction Camera”."];
+}
+
+- (void)request:(OSSystemExtensionRequest *)request didFinishWithResult:(OSSystemExtensionRequestResult)result {
+    NSString *message = result == OSSystemExtensionRequestWillCompleteAfterReboot
+        ? @"Virtual camera install will finish after reboot"
+        : @"Virtual camera installed";
+    [self logLine:message];
+    if (self.settingsStatusLabel) {
+        self.settingsStatusLabel.stringValue = result == OSSystemExtensionRequestWillCompleteAfterReboot
+            ? [self textEN:@"Virtual camera will finish installing after reboot." ru:@"Виртуальная камера завершит установку после перезагрузки."]
+            : [self textEN:@"Virtual camera installed. Choose “spec3 correction Camera” in Zoom/Meet/Yandex." ru:@"Виртуальная камера установлена. Выберите “spec3 correction Camera” в Zoom/Meet/Яндекс."];
+    }
+}
+
+- (void)request:(OSSystemExtensionRequest *)request didFailWithError:(NSError *)error {
+    NSString *message = [NSString stringWithFormat:@"Virtual camera install failed: %@ (%ld)", error.localizedDescription, (long)error.code];
+    [self logLine:message];
+    if (self.settingsStatusLabel) {
+        self.settingsStatusLabel.stringValue = [self textEN:@"Virtual camera install failed. Open Logs for details." ru:@"Не удалось установить виртуальную камеру. Откройте логи для деталей."];
+    }
+    [self showAlert:@"Virtual camera install failed" message:message];
 }
 
 - (void)showLogWindow:(id)sender {

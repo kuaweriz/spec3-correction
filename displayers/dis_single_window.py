@@ -34,12 +34,16 @@ from utils.logger import Logger
 from utils.camera_selection import (
     CameraInfo,
     camera_name,
+    is_virtual_camera,
     is_virtual_camera_name,
     list_macos_cameras,
+    load_saved_camera_open_id,
     load_saved_camera_name,
     physical_camera_options,
     save_camera_id,
 )
+from utils.virtual_camera_bridge import VirtualCameraFrameSink
+from utils.obs_mjpeg_bridge import ObsMjpegBridge
 from displayers.face_predictor import (
     FacePredictor,
     EyeExtractionConfig,
@@ -163,6 +167,7 @@ class CameraFrameStream:
     def __init__(self, cap, logger: Logger):
         self.cap = cap
         self.logger = logger
+        self.started_at = time.monotonic()
         self._lock = threading.Lock()
         self._running = True
         self._frame: np.ndarray | None = None
@@ -320,6 +325,15 @@ class SingleWindowGazeCorrector:
         self._camera_refreshing = False
         self._camera_options_refreshed_at = 0.0
         self._camera_refresh_interval = 8.0
+        self._camera_live_saved_for_id: Optional[int] = None
+        self._next_camera_reopen_at = 0.0
+        self._camera_reopen_attempts = 0
+        self._camera_service_reset_done = False
+        self._virtual_camera_sink = VirtualCameraFrameSink()
+        self._obs_mjpeg_bridge = ObsMjpegBridge()
+        self._obs_mjpeg_bridge.start()
+        if self._obs_mjpeg_bridge.enabled:
+            self.logger.log(f"OBS MJPEG bridge ready: {self._obs_mjpeg_bridge.url}")
         self.refresh_camera_options(async_refresh=True)
 
         # Store default values for reset
@@ -397,22 +411,35 @@ class SingleWindowGazeCorrector:
             elif not self.camera_options:
                 self.camera_options = [CameraInfo(self.camera_id, f"Camera {self.camera_id}")]
 
+            active_camera = next((camera for camera in cameras if camera.id == active_id), None)
             active_name = self._camera_label_overrides.get(
                 active_id,
                 camera_name(active_id, cameras) if cameras else f"Camera {active_id}",
             )
-            active_is_hidden_virtual = is_virtual_camera_name(active_name)
+            active_is_hidden_virtual = (
+                is_virtual_camera(active_camera)
+                if active_camera is not None
+                else is_virtual_camera_name(active_name)
+            )
             if all(camera.id != active_id for camera in self.camera_options) and not active_is_hidden_virtual:
                 self.camera_options.append(CameraInfo(active_id, f"Camera {active_id}"))
                 self.camera_options = self._deduplicate_camera_options(self.camera_options, active_id)
 
             if active_is_hidden_virtual and self.camera_options:
-                physical = self.camera_options[0]
-                if self._pending_camera_id is None:
-                    self._pending_camera_id = physical.id
-                    self._pending_camera_label = physical.name
-                    self._camera_switching = True
-                active_id = physical.id
+                # OpenCV can remap a real camera to a native slot that macOS
+                # names as virtual/stale. Keep the UI label on the requested
+                # physical camera, but never queue an automatic switch from this
+                # refresh path; doing that can loop and freeze the app.
+                label_key = self._camera_label_key(self.camera_label)
+                matching_physical = next(
+                    (
+                        camera
+                        for camera in self.camera_options
+                        if self._camera_label_key(camera.name) == label_key
+                    ),
+                    None,
+                )
+                active_id = matching_physical.id if matching_physical is not None else self.camera_options[0].id
 
             if not self.camera_options and cameras:
                 self.camera_label = self.tr("No physical camera", "Нет физической камеры")
@@ -515,6 +542,24 @@ class SingleWindowGazeCorrector:
     def request_camera_select(self, camera_id: int, label: str) -> None:
         """Queue a camera switch from the UI; applied in the main loop."""
         self.camera_dropdown_open = False
+
+        if self._camera_switching:
+            self._set_camera_status("Camera is already opening", 1.4)
+            return
+
+        current_label_key = self._camera_label_key(self.camera_label)
+        requested_label_key = self._camera_label_key(label)
+        if (
+            requested_label_key
+            and requested_label_key == current_label_key
+            and not is_virtual_camera_name(label)
+        ):
+            self._camera_label_overrides[self.camera_id] = label
+            self.camera_label = label
+            self._save_selected_camera()
+            self._set_camera_status("Already selected", 1.4)
+            return
+
         self.camera_label = label
         self._set_camera_status(f"Switching to {self._short_label(label, 28)}...", 2.5)
         if camera_id != self.camera_id:
@@ -522,8 +567,8 @@ class SingleWindowGazeCorrector:
             self._pending_camera_label = label
             self._camera_switching = True
         else:
-            save_camera_id(self.camera_id, label)
             self._camera_label_overrides[self.camera_id] = label
+            self._save_selected_camera()
             self._set_camera_status("Already selected", 1.4)
 
     def _short_camera_label(self, max_chars: int = 25) -> str:
@@ -544,7 +589,7 @@ class SingleWindowGazeCorrector:
             return "Scanning cameras..."
         if time.monotonic() < self._camera_status_until:
             return self._camera_status_message
-        return f"Selected slot #{self.camera_id}"
+        return f"{self.tr('Selected', 'Выбрана')}: {self._short_camera_label(22)}"
 
     def _remember_camera_label(self, camera_id: int, label: str) -> None:
         clean_label = label.strip() or f"Camera {camera_id}"
@@ -561,6 +606,41 @@ class SingleWindowGazeCorrector:
             if not replaced:
                 updated_options.append(CameraInfo(camera_id, clean_label))
             self.camera_options = self._deduplicate_camera_options(updated_options, camera_id)
+
+    def _camera_info_for_id(self, camera_id: int) -> CameraInfo | None:
+        with self._camera_refresh_lock:
+            cameras = list(self._all_camera_options) + list(self.camera_options)
+        return next((camera for camera in cameras if camera.id == camera_id), None)
+
+    def _selected_physical_camera_info(self) -> CameraInfo | None:
+        label_key = self._camera_label_key(self.camera_label)
+        with self._camera_refresh_lock:
+            cameras = list(self._all_camera_options) + list(self.camera_options)
+
+        current_info = next((camera for camera in cameras if camera.id == self.camera_id), None)
+        if current_info is not None and not is_virtual_camera(current_info):
+            return current_info
+
+        return next(
+            (
+                camera
+                for camera in cameras
+                if not is_virtual_camera(camera) and self._camera_label_key(camera.name) == label_key
+            ),
+            None,
+        )
+
+    def _save_selected_camera(self, open_camera_id: int | None = None) -> None:
+        if is_virtual_camera_name(self.camera_label):
+            return
+        info = self._selected_physical_camera_info()
+        saved_id = info.id if info is not None else self.camera_id
+        save_camera_id(
+            saved_id,
+            info.name if info is not None else self.camera_label,
+            info.unique_id if info is not None else None,
+            open_camera_id,
+        )
 
     def _fit_text(self, text: str, max_width: int, size: int, bold: bool = False) -> str:
         if self._measure_text(text, size, bold)[0] <= max_width:
@@ -1046,7 +1126,10 @@ class SingleWindowGazeCorrector:
         for index, camera in enumerate(camera_options[:max_rows]):
             row_y1 = y + 5 + index * row_h
             row_y2 = row_y1 + row_h
-            active = camera.id == self.camera_id
+            active = (
+                camera.id == self.camera_id
+                or self._camera_label_key(camera.name) == self._camera_label_key(self.camera_label)
+            )
             hover_bg = (237, 240, 245) if light else (39, 37, 34)
             active_bg = (230, 235, 245) if light else (48, 41, 35)
             self._draw_round_rect(canvas, (x1 + 6, row_y1, x2 - 6, row_y2), active_bg if active else hover_bg, 4)
@@ -1780,6 +1863,7 @@ class SingleWindowGazeCorrector:
         score = mean * 0.55 + std * 1.35 + bright_ratio * 42.0
         usable = (
             (mean >= 12.0 and std >= 7.0)
+            or (mean >= 2.0 and std >= 3.0)
             or (std >= 26.0 and bright_ratio >= 0.06)
             or bright_ratio >= 0.18
         )
@@ -1788,7 +1872,7 @@ class SingleWindowGazeCorrector:
     def _frame_looks_blank(self, frame: np.ndarray) -> bool:
         """Detect AVFoundation placeholder frames that look opened but are not a live camera."""
         usable, _score, mean, std, bright_ratio = self._frame_live_metrics(frame)
-        return not usable and mean < 4.0 and std < 11.0 and bright_ratio < 0.025
+        return not usable and mean < 1.1 and std < 3.0 and bright_ratio < 0.002
 
     def _skin_pixel_ratio(self, frame: np.ndarray) -> float:
         """Estimate how much of a probe frame looks like live face skin."""
@@ -1843,7 +1927,14 @@ class SingleWindowGazeCorrector:
             and center_bright_ratio > 0.004
             and (bright_ratio > 0.004 or std > 10.0)
         )
-        return (skin_ratio < 0.012 and has_idle_card_shape) or static_logo_card
+        dark_text_card = (
+            temporal_delta < 0.18
+            and skin_ratio < 0.004
+            and mean < 4.0
+            and std > 3.0
+            and dark_ratio > 0.985
+        )
+        return (skin_ratio < 0.012 and has_idle_card_shape) or static_logo_card or dark_text_card
 
     def _frame_looks_physical_probe(
         self,
@@ -1855,7 +1946,13 @@ class SingleWindowGazeCorrector:
         if not usable:
             return False
         skin_ratio = self._skin_pixel_ratio(frame)
-        return skin_ratio >= 0.018 or temporal_delta >= 0.55
+        if skin_ratio >= 0.018:
+            return True
+
+        # If this slot is mislabeled by macOS/OpenCV but the image is otherwise
+        # usable and not one of the rejected idle cards, keep it. A physical
+        # webcam may be pointed at a static room before the face enters frame.
+        return temporal_delta >= 0.12 or skin_ratio >= 0.006 or usable
 
     def _camera_candidate_ids(self, preferred_id: int, requested_label: str) -> list[int]:
         candidates: list[int] = []
@@ -1868,20 +1965,25 @@ class SingleWindowGazeCorrector:
             candidates.append(candidate_id)
 
         add(preferred_id)
-
         physical_first = sorted(
-            (camera for camera in camera_options if not is_virtual_camera_name(camera.name)),
+            (camera for camera in camera_options if not is_virtual_camera(camera)),
             key=lambda camera: camera.id,
         )
         for camera in physical_first:
             add(camera.id)
 
+        # Saved open slots are only hints. Try the named physical cameras first
+        # because AVFoundation slot numbers shift when virtual/iPhone cameras
+        # appear or disappear.
+        saved_open_id = load_saved_camera_open_id()
+        if saved_open_id is not None:
+            add(saved_open_id)
+
         # OpenCV can expose AVFoundation devices in a different order from the
-        # native device list. Probe only known slots when macOS gave us a list,
-        # otherwise keep a small blind fallback for unusual systems.
-        probe_limit = max((camera.id for camera in camera_options), default=5) + 1
-        if not camera_options:
-            probe_limit = 6
+        # native list, especially when camera extensions are installed. Keep a
+        # tiny blind fallback so a hidden physical slot can still be found.
+        native_limit = max((camera.id for camera in camera_options), default=2) + 1
+        probe_limit = native_limit if camera_options else 4
         for camera_id in range(probe_limit):
             add(camera_id)
 
@@ -1893,6 +1995,7 @@ class SingleWindowGazeCorrector:
         require_live_frame: bool = True,
         reject_static_placeholder: bool = False,
         reject_native_virtual_slot: bool = False,
+        allow_warmup_frame: bool = False,
     ):
         """Open one concrete OpenCV camera slot and verify it returns a live frame."""
         camera_id = self.camera_id if camera_id is None else camera_id
@@ -1914,6 +2017,10 @@ class SingleWindowGazeCorrector:
 
             requested_w = max(1280, min(self.display_cfg.video_size[0], self.display_cfg.processing_max_size[0]))
             requested_h = max(720, min(self.display_cfg.video_size[1], self.display_cfg.processing_max_size[1]))
+            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 550)
+            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 550)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, requested_w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, requested_h)
             cap.set(cv2.CAP_PROP_FPS, 30)
@@ -1921,14 +2028,19 @@ class SingleWindowGazeCorrector:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             has_frame = False
+            empty_reads = 0
             best_metrics: tuple[bool, float, float, float, float] | None = None
             best_frame: np.ndarray | None = None
             previous_probe: np.ndarray | None = None
             max_temporal_delta = 0.0
-            probe_frames = 60 if require_live_frame else 20
+            if reject_native_virtual_slot:
+                probe_frames = 5
+            else:
+                probe_frames = 32 if require_live_frame else 12
             for _ in range(probe_frames):
                 ret, test_frame = cap.read()
                 if ret and test_frame is not None:
+                    empty_reads = 0
                     has_frame = True
                     metrics = self._frame_live_metrics(test_frame)
                     if best_metrics is None or metrics[1] > best_metrics[1]:
@@ -1945,22 +2057,17 @@ class SingleWindowGazeCorrector:
                     previous_probe = probe
                     if require_live_frame and metrics[0]:
                         break
+                else:
+                    empty_reads += 1
+                    if reject_native_virtual_slot and empty_reads >= 2:
+                        break
+                    if empty_reads >= 10:
+                        break
                 time.sleep(0.025)
             if not has_frame:
                 cap.release()
                 self.logger.log(f"Camera {camera_id} opened with {backend_name} but returned no frames")
                 continue
-
-            if best_metrics is not None:
-                usable, score, mean, std, bright_ratio = best_metrics
-                if require_live_frame and not usable:
-                    cap.release()
-                    self.logger.log(
-                        "Camera "
-                        f"{camera_id} returned a blank/inactive image "
-                        f"(score={score:.1f}, mean={mean:.1f}, std={std:.1f}, bright={bright_ratio:.2f})"
-                    )
-                    continue
 
             if (
                 reject_static_placeholder
@@ -1974,6 +2081,38 @@ class SingleWindowGazeCorrector:
                     f"(motion={max_temporal_delta:.3f}); trying another slot"
                 )
                 continue
+
+            if best_metrics is not None:
+                usable, score, mean, std, bright_ratio = best_metrics
+                low_light_live = (
+                    max_temporal_delta > 0.22
+                    and mean > 2.0
+                    and std > 4.0
+                    and bright_ratio > 0.002
+                )
+                usable = usable or low_light_live
+                if require_live_frame and not usable:
+                    clean_dark_warmup = mean < 1.2 and std < 2.5 and bright_ratio < 0.001
+                    if allow_warmup_frame and best_frame is not None and clean_dark_warmup:
+                        self.logger.log(
+                            "Camera "
+                            f"{camera_id} returned dark startup frames; keeping it open "
+                            f"for warmup (score={score:.1f}, mean={mean:.1f}, "
+                            f"std={std:.1f}, bright={bright_ratio:.2f})"
+                        )
+                        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        self.logger.log(
+                            f"Camera {camera_id} opened with {backend_name} at {actual_w}x{actual_h}"
+                        )
+                        return cap
+                    cap.release()
+                    self.logger.log(
+                        "Camera "
+                        f"{camera_id} returned a blank/inactive image "
+                        f"(score={score:.1f}, mean={mean:.1f}, std={std:.1f}, bright={bright_ratio:.2f})"
+                    )
+                    continue
 
             if (
                 reject_native_virtual_slot
@@ -2008,11 +2147,19 @@ class SingleWindowGazeCorrector:
         candidates = self._camera_candidate_ids(preferred_id, label) if allow_fallback else [preferred_id]
 
         for candidate_id in candidates:
+            candidate_info = self._camera_info_for_id(candidate_id)
             candidate_label = self._camera_label_overrides.get(
                 candidate_id,
-                camera_name(candidate_id, self._all_camera_options or self.camera_options),
+                candidate_info.name
+                if candidate_info is not None
+                else camera_name(candidate_id, self._all_camera_options or self.camera_options),
             )
-            candidate_is_native_virtual = is_virtual_camera_name(candidate_label)
+            requested_is_physical = bool(label and not is_virtual_camera_name(label))
+            candidate_is_native_virtual = (
+                is_virtual_camera(candidate_info)
+                if candidate_info is not None
+                else is_virtual_camera_name(candidate_label)
+            )
             if label and not is_virtual_camera_name(label) and candidate_is_native_virtual:
                 self.logger.log(
                     f"Probing native-virtual slot {candidate_id} ({candidate_label}) "
@@ -2025,6 +2172,7 @@ class SingleWindowGazeCorrector:
                 reject_native_virtual_slot=bool(
                     label and not is_virtual_camera_name(label) and candidate_is_native_virtual
                 ),
+                allow_warmup_frame=bool(requested_is_physical and not candidate_is_native_virtual),
             )
             if cap is not None:
                 if candidate_id != preferred_id:
@@ -2038,6 +2186,61 @@ class SingleWindowGazeCorrector:
         self._set_camera_status("No live camera frame", 3.0)
 
         return None, preferred_id
+
+    def _reset_camera_services_once(self, force: bool = False) -> None:
+        """Ask macOS to restart the camera broker once after virtual slots get stuck."""
+        if self._camera_service_reset_done and not force:
+            return
+        self._camera_service_reset_done = True
+        self.logger.log("Resetting macOS camera service after failed live-camera probes")
+        try:
+            subprocess.run(
+                ["killall", "avconferenced"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _try_reopen_missing_camera(self) -> Optional[CameraFrameStream]:
+        """Retry camera startup after macOS or another app temporarily held the device."""
+        now = time.monotonic()
+        if now < self._next_camera_reopen_at:
+            return None
+
+        self._camera_reopen_attempts += 1
+        delay = min(6.0, 1.0 + self._camera_reopen_attempts * 0.65)
+        self._next_camera_reopen_at = now + delay
+        self.refresh_camera_options(force=True, async_refresh=True)
+        if self._camera_reopen_attempts == 1 or self._camera_reopen_attempts % 6 == 0:
+            self._reset_camera_services_once(force=self._camera_reopen_attempts % 6 == 0)
+            time.sleep(0.45)
+        self.logger.log(
+            f"Retrying camera startup (attempt {self._camera_reopen_attempts})"
+        )
+        cap, actual_camera_id = self._open_camera_capture(
+            self.camera_id,
+            self.camera_label,
+            allow_remap=True,
+        )
+        if cap is None:
+            self._set_camera_status("Waiting for camera", 2.0)
+            return None
+
+        if actual_camera_id != self.camera_id:
+            self.camera_id = actual_camera_id
+        self._remember_camera_label(self.camera_id, self.camera_label)
+        self._save_selected_camera()
+        self._camera_live_saved_for_id = None
+        self._camera_reopen_attempts = 0
+        self._next_camera_reopen_at = 0.0
+        self._camera_service_reset_done = False
+        self._set_camera_status(f"Camera live on slot #{self.camera_id}", 3.0)
+        self.logger.log(f"Camera recovered on startup retry: slot {self.camera_id}")
+        self.gaze_corrector.reset_tracking()
+        return CameraFrameStream(cap, self.logger)
 
     def _update_video_size_from_frame(self, frame: np.ndarray) -> None:
         frame_h, frame_w = frame.shape[:2]
@@ -2087,8 +2290,8 @@ class SingleWindowGazeCorrector:
             self._all_camera_options or self.camera_options,
         )
         self._remember_camera_label(self.camera_id, self.camera_label)
-        if not is_virtual_camera_name(self.camera_label):
-            save_camera_id(self.camera_id, self.camera_label)
+        self._save_selected_camera()
+        self._camera_live_saved_for_id = None
         self._camera_switching = False
         self._set_camera_status(f"Selected slot #{self.camera_id}", 2.0)
         self.refresh_camera_options(force=False, async_refresh=True)
@@ -2114,8 +2317,8 @@ class SingleWindowGazeCorrector:
                 self._all_camera_options or self.camera_options,
             )
             self._remember_camera_label(self.camera_id, self.camera_label)
-            if not is_virtual_camera_name(self.camera_label):
-                save_camera_id(self.camera_id, self.camera_label)
+            self._save_selected_camera()
+            self._camera_live_saved_for_id = None
             self._set_camera_status(f"Recovered camera on slot #{self.camera_id}", 3.0)
             self.logger.log(f"Recovered camera stream: {previous_id} -> {self.camera_id}")
             self.gaze_corrector.reset_tracking()
@@ -2131,12 +2334,13 @@ class SingleWindowGazeCorrector:
         if cap is None:
             self.logger.log(f"Could not open camera {self.camera_id}; keeping app open without live stream")
             stream: Optional[CameraFrameStream] = None
+            self._next_camera_reopen_at = time.monotonic() + 0.5
         else:
             if actual_camera_id != self.camera_id:
                 self.camera_id = actual_camera_id
             self._remember_camera_label(self.camera_id, self.camera_label)
-            if not is_virtual_camera_name(self.camera_label):
-                save_camera_id(self.camera_id, self.camera_label)
+            self._save_selected_camera()
+            self._camera_live_saved_for_id = None
             stream = CameraFrameStream(cap, self.logger)
 
         self.create_settings_panel()
@@ -2153,7 +2357,15 @@ class SingleWindowGazeCorrector:
                 break
 
             if stream is None:
+                recovered_stream = self._try_reopen_missing_camera()
+                if recovered_stream is not None:
+                    stream = recovered_stream
+                    failed_reads = 0
+                    last_frame_id = 0
+                    blank_frame_streak = 0
+                    continue
                 display_frame = self._make_inactive_preview_frame("No live physical camera frame")
+                self._obs_mjpeg_bridge.update(display_frame)
                 key = self._display_app_frame_and_get_key(display_frame)
                 time.sleep(0.03)
                 key_ascii = key & 0xFF
@@ -2214,7 +2426,10 @@ class SingleWindowGazeCorrector:
                 blank_frame_streak += 1
                 if blank_frame_streak == 1:
                     self.logger.log("Camera is returning blank placeholder frames")
-                if blank_frame_streak > 75:
+                stream_age = time.monotonic() - stream.started_at
+                if stream_age < 10.0 and blank_frame_streak <= 300:
+                    self._set_camera_status("Camera is warming up", 1.0)
+                elif blank_frame_streak > 90:
                     recovered = self._recover_camera_stream(stream, "Camera returned blank frames")
                     if recovered is not None:
                         stream = recovered
@@ -2229,6 +2444,9 @@ class SingleWindowGazeCorrector:
                     continue
             else:
                 blank_frame_streak = 0
+                if self._camera_live_saved_for_id != self.camera_id:
+                    self._save_selected_camera(open_camera_id=self.camera_id)
+                    self._camera_live_saved_for_id = self.camera_id
             frame = self._prepare_pipeline_frame(frame)
             self._update_video_size_from_frame(frame)
 
@@ -2236,6 +2454,8 @@ class SingleWindowGazeCorrector:
                 display_frame = self.process_frame(frame)
             else:
                 display_frame = frame.copy()
+            self._virtual_camera_sink.write(display_frame)
+            self._obs_mjpeg_bridge.update(display_frame)
 
             # Draw calibration overlay if enabled
             if self.calibration_mode:
@@ -2276,7 +2496,10 @@ class SingleWindowGazeCorrector:
 
         # Cleanup
         self.gaze_corrector.save_tuning_settings()
-        stream.release()
+        if stream is not None:
+            stream.release()
+        self._virtual_camera_sink.close()
+        self._obs_mjpeg_bridge.close()
         cv2.destroyAllWindows()
         self.gaze_corrector.close()
         self.logger.log("Shutdown complete")

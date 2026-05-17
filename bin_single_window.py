@@ -22,7 +22,11 @@ from utils.camera_selection import choose_camera_id
 
 def detect_camera_resolution(camera_id: int) -> tuple[int, int]:
     """
-    Detect the actual resolution of the specified camera.
+    Return the initial preview resolution.
+
+    The live window updates itself from the first real frame. Avoid opening the
+    camera here: on macOS, quickly opening and closing the same device before
+    the main stream starts can leave AVFoundation returning blank frames.
     
     Args:
         camera_id: Camera device ID
@@ -30,38 +34,8 @@ def detect_camera_resolution(camera_id: int) -> tuple[int, int]:
     Returns:
         Tuple of (width, height) in pixels
     """
-    cap = None
-    if hasattr(cv2, "CAP_AVFOUNDATION"):
-        cap = cv2.VideoCapture(camera_id, cv2.CAP_AVFOUNDATION)
-    if cap is None or not cap.isOpened():
-        if cap is not None:
-            cap.release()
-        cap = cv2.VideoCapture(camera_id)
-    if not cap.isOpened():
-        print(f"Warning: Could not open camera {camera_id}, using default resolution")
-        return (1280, 720)
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    ret = False
-    frame = None
-    for _ in range(12):
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            break
-    if ret and frame is not None:
-        height, width = frame.shape[:2]
-    else:
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if width <= 0 or height <= 0:
-            width, height = 1280, 720
-    cap.release()
-    
-    print(f"Detected camera resolution: {width}x{height}")
-    return (width, height)
+    print(f"Initial camera resolution: 1280x720 for camera {camera_id}")
+    return (1280, 720)
 
 
 def main():

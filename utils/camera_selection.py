@@ -12,6 +12,7 @@ from pathlib import Path
 
 APP_SUPPORT_NAME = "spec3 correction"
 VIRTUAL_CAMERA_TOKENS = ("virtual", "gazeat", "casablanca", "obs", "sample", "snap")
+CONTINUITY_CAMERA_TOKENS = ("iphone", "ipad", "continuity")
 _CAMERA_CACHE_TTL_SECONDS = 8.0
 _camera_cache: list["CameraInfo"] | None = None
 _camera_cache_time = 0.0
@@ -58,10 +59,45 @@ def load_saved_camera_name() -> str | None:
     return camera_name if isinstance(camera_name, str) and camera_name else None
 
 
-def save_camera_id(camera_id: int, camera_name: str | None = None) -> None:
+def load_saved_camera_unique_id() -> str | None:
+    try:
+        data = json.loads(_settings_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    unique_id = data.get("camera_unique_id")
+    return unique_id if isinstance(unique_id, str) and unique_id else None
+
+
+def load_saved_camera_open_id() -> int | None:
+    try:
+        data = json.loads(_settings_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    camera_open_id = data.get("camera_open_id")
+    return camera_open_id if isinstance(camera_open_id, int) and camera_open_id >= 0 else None
+
+
+def save_camera_id(
+    camera_id: int,
+    camera_name: str | None = None,
+    camera_unique_id: str | None = None,
+    camera_open_id: int | None = None,
+) -> None:
+    try:
+        previous = json.loads(_settings_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        previous = {}
     data = {"camera_id": int(camera_id)}
     if camera_name:
         data["camera_name"] = camera_name
+    if camera_unique_id:
+        data["camera_unique_id"] = camera_unique_id
+    if camera_open_id is not None and camera_open_id >= 0:
+        data["camera_open_id"] = int(camera_open_id)
+    elif isinstance(previous.get("camera_open_id"), int) and previous["camera_open_id"] >= 0:
+        data["camera_open_id"] = int(previous["camera_open_id"])
     try:
         _settings_path().write_text(
             json.dumps(data, indent=2, ensure_ascii=False),
@@ -190,14 +226,48 @@ def camera_name(camera_id: int, cameras: list[CameraInfo] | None = None) -> str:
 
 
 def is_virtual_camera_name(name: str) -> bool:
-    lower = name.lower()
+    lower = _normalise_camera_name(name).lower()
     return any(token in lower for token in VIRTUAL_CAMERA_TOKENS)
 
 
+def is_virtual_camera(camera: CameraInfo) -> bool:
+    haystack = " ".join(
+        _normalise_camera_name(value).lower()
+        for value in (camera.name, camera.model_id, camera.unique_id)
+        if value
+    )
+    return any(token in haystack for token in VIRTUAL_CAMERA_TOKENS)
+
+
+def is_continuity_camera(camera: CameraInfo) -> bool:
+    haystack = " ".join(
+        _normalise_camera_name(value).lower()
+        for value in (camera.name, camera.model_id, camera.unique_id)
+        if value
+    )
+    return any(token in haystack for token in CONTINUITY_CAMERA_TOKENS)
+
+
 def physical_camera_options(cameras: list[CameraInfo]) -> list[CameraInfo]:
-    """Return only real cameras for user-facing selection."""
-    physical = [camera for camera in cameras if not is_virtual_camera_name(camera.name)]
-    return physical
+    """Return stable real cameras for user-facing selection.
+
+    Continuity Camera can appear and disappear as the iPhone wakes/sleeps. If a
+    built-in or USB camera is present, keep the iPhone out of the default list so
+    the app does not jump to it while the user is trying to select MacBook camera.
+    """
+    physical = [camera for camera in cameras if not is_virtual_camera(camera)]
+    non_continuity = [camera for camera in physical if not is_continuity_camera(camera)]
+    if non_continuity:
+        physical = non_continuity
+    cleaned: list[CameraInfo] = []
+    seen: set[str] = set()
+    for camera in physical:
+        identity = camera.unique_id or _normalise_camera_name(camera.name).casefold()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        cleaned.append(camera)
+    return cleaned
 
 
 def choose_camera_id(requested_camera_id: int) -> int:
@@ -217,44 +287,74 @@ def choose_camera_id(requested_camera_id: int) -> int:
     cameras = list_macos_cameras()
     saved_camera_id = load_saved_camera_id()
     saved_camera_name = load_saved_camera_name()
+    saved_camera_unique_id = load_saved_camera_unique_id()
     saved_camera = next((camera for camera in cameras if camera.id == saved_camera_id), None)
     visible_cameras = physical_camera_options(cameras)
 
-    if saved_camera_name and not is_virtual_camera_name(saved_camera_name):
-        if saved_camera is not None and _camera_names_match(saved_camera.name, saved_camera_name):
-            print(f"Using saved camera slot {saved_camera.id}: {saved_camera.name}")
-            return saved_camera.id
-
-        if saved_camera_id is not None and saved_camera is not None and is_virtual_camera_name(saved_camera.name):
-            print(
-                "Using saved OpenCV camera slot "
-                f"{saved_camera_id}: it was saved as {saved_camera_name}, "
-                f"but macOS now reports {saved_camera.name}"
-            )
-            return saved_camera_id
-
-        saved_by_name = next(
-            (camera for camera in cameras if _camera_names_match(camera.name, saved_camera_name)),
+    if saved_camera_unique_id:
+        saved_by_unique_id = next(
+            (
+                camera
+                for camera in visible_cameras
+                if _normalise_camera_name(camera.unique_id)
+                == _normalise_camera_name(saved_camera_unique_id)
+            ),
             None,
         )
-        if saved_by_name is not None and not is_virtual_camera_name(saved_by_name.name):
+        if saved_by_unique_id is not None:
+            print(f"Using saved camera by unique id {saved_by_unique_id.id}: {saved_by_unique_id.name}")
+            if saved_by_unique_id.id != saved_camera_id:
+                save_camera_id(
+                    saved_by_unique_id.id,
+                    saved_by_unique_id.name,
+                    saved_by_unique_id.unique_id,
+                )
+            return saved_by_unique_id.id
+
+    if saved_camera_name and not is_virtual_camera_name(saved_camera_name):
+        if (
+            saved_camera is not None
+            and not is_virtual_camera(saved_camera)
+            and _camera_names_match(saved_camera.name, saved_camera_name)
+        ):
+            print(f"Using saved camera slot {saved_camera.id}: {saved_camera.name}")
+            if saved_camera.unique_id and saved_camera_unique_id != saved_camera.unique_id:
+                save_camera_id(saved_camera.id, saved_camera.name, saved_camera.unique_id)
+            return saved_camera.id
+
+        saved_by_name = next(
+            (camera for camera in visible_cameras if _camera_names_match(camera.name, saved_camera_name)),
+            None,
+        )
+        if saved_by_name is not None:
             print(f"Using saved camera by name {saved_by_name.id}: {saved_by_name.name}")
             if saved_by_name.id != saved_camera_id:
-                save_camera_id(saved_by_name.id, saved_by_name.name)
+                save_camera_id(saved_by_name.id, saved_by_name.name, saved_by_name.unique_id)
             return saved_by_name.id
 
-        if saved_camera is not None and not is_virtual_camera_name(saved_camera.name):
+        if saved_camera is not None and not is_virtual_camera(saved_camera):
             print(
                 "Saved camera name was not found in the current list; "
                 f"falling back to slot {saved_camera.id}: {saved_camera.name}"
             )
+            if saved_camera.unique_id:
+                save_camera_id(saved_camera.id, saved_camera.name, saved_camera.unique_id)
             return saved_camera.id
+
+        if saved_camera_id is not None and saved_camera is not None and is_virtual_camera(saved_camera):
+            print(
+                "Ignoring stale saved camera slot "
+                f"{saved_camera_id}: it was saved as {saved_camera_name}, "
+                f"but macOS now reports {saved_camera.name}"
+            )
 
     if saved_camera_name and is_virtual_camera_name(saved_camera_name):
         print(f"Ignoring saved virtual camera: {saved_camera_name}")
 
-    if saved_camera is not None and not is_virtual_camera_name(saved_camera.name):
+    if saved_camera is not None and not is_virtual_camera(saved_camera):
         print(f"Using saved camera {saved_camera.id}: {saved_camera.name}")
+        if saved_camera.unique_id:
+            save_camera_id(saved_camera.id, saved_camera.name, saved_camera.unique_id)
         return saved_camera_id
 
     if not cameras:
@@ -277,7 +377,7 @@ def choose_camera_id(requested_camera_id: int) -> int:
         score = 0
         if any(token in lower for token in preferred_tokens):
             score += 100
-        if is_virtual_camera_name(camera.name):
+        if is_virtual_camera(camera):
             score -= 100
         if score > best_score:
             best_camera = camera
@@ -288,5 +388,5 @@ def choose_camera_id(requested_camera_id: int) -> int:
         return 0
 
     print(f"Selected camera {best_camera.id}: {best_camera.name}")
-    save_camera_id(best_camera.id, best_camera.name)
+    save_camera_id(best_camera.id, best_camera.name, best_camera.unique_id)
     return best_camera.id
