@@ -32,6 +32,10 @@ The goal is simple: when you read from the screen, your eyes should look steadie
 - **Single-window workflow**: camera preview, controls, logs, settings, and training live in one native-feeling macOS app.
 - **Local first**: processing runs on your Mac; the app does not need a cloud service to work.
 
+<p align="center">
+  <img src="docs/assets/spec3-ui-preview.svg" alt="spec3 correction app preview" width="92%">
+</p>
+
 ## How It Works
 
 ```text
@@ -73,6 +77,18 @@ The practical video-call route is OBS:
 Why OBS? macOS virtual cameras are system camera extensions. A fully branded `spec3 correction Camera` requires Apple Developer system-extension signing. OBS already ships a trusted virtual camera, so `spec3 correction` can use it as a reliable bridge.
 
 More detail: [OBS Bridge](docs/obs_bridge.md).
+
+## Documentation
+
+| Guide | What It Covers |
+| --- | --- |
+| [Getting Started](docs/getting_started.md) | First launch, camera permission, setup, and safe defaults. |
+| [Personal AI Training](docs/training.md) | How to record useful READ, LIVE, and LOOK examples. |
+| [Camera Troubleshooting](docs/camera_troubleshooting.md) | Black preview, stale camera names, busy devices, and macOS permission resets. |
+| [OBS Bridge](docs/obs_bridge.md) | How to route the corrected feed into video calls through OBS. |
+| [Architecture](docs/architecture.md) | Runtime flow, modules, quality rules, and future direction. |
+| [Virtual Camera](docs/virtual_camera.md) | Native macOS virtual-camera notes and signing requirements. |
+| [Roadmap](docs/roadmap.md) | What is planned next for realism, READ detection, and packaging. |
 
 ## Main Controls
 
@@ -131,6 +147,24 @@ Start the OBS bridge manually:
 ./script/start_obs_bridge.sh
 ```
 
+Run the lightweight repository check:
+
+```bash
+./script/repository_check.sh
+```
+
+Useful project paths:
+
+| Path | Purpose |
+| --- | --- |
+| `bin_single_window.py` | Main app entry point. |
+| `displayers/dis_single_window.py` | Preview, controls, windows, and UI state. |
+| `displayers/face_predictor.py` | Face landmarks, eye crops, and tracking data. |
+| `model_managers/` | Gaze correction, personal model, and settings logic. |
+| `utils/camera_selection.py` | Camera discovery and camera-picker behavior. |
+| `utils/obs_mjpeg_bridge.py` | Local corrected-video bridge used by OBS. |
+| `virtual_camera/` | Native CoreMediaIO camera-extension experiment. |
+
 ## Troubleshooting
 
 - **Preview is black**: choose the correct physical camera and close any app that may be holding it.
@@ -139,6 +173,10 @@ Start the OBS bridge manually:
 - **READ mode feels wrong**: record new Personal AI examples in the same lighting and screen position you normally use.
 - **Eyes look too frozen**: lower `Reading Hold` or increase `Eye Life`.
 - **Eyes move too much while reading**: increase `Stabilizer Power` and `Reading Hold`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development flow, checks, and pull-request expectations.
 
 ## Project Status
 

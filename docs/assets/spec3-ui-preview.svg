@@ -1,0 +1,108 @@
+<svg width="1180" height="620" viewBox="0 0 1180 620" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="page" x1="0" y1="0" x2="1180" y2="620" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#070812"/>
+      <stop offset="0.55" stop-color="#151018"/>
+      <stop offset="1" stop-color="#10242A"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="790" y1="62" x2="1112" y2="540" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#21181C"/>
+      <stop offset="1" stop-color="#130F11"/>
+    </linearGradient>
+    <linearGradient id="video" x1="72" y1="62" x2="760" y2="540" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#080A12"/>
+      <stop offset="0.55" stop-color="#121D26"/>
+      <stop offset="1" stop-color="#2D4851"/>
+    </linearGradient>
+    <radialGradient id="glow1" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(294 158) rotate(31) scale(330 230)">
+      <stop stop-color="#8E63FF" stop-opacity="0.44"/>
+      <stop offset="1" stop-color="#8E63FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(693 446) rotate(-23) scale(320 220)">
+      <stop stop-color="#6DEBFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#6DEBFF" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="20" y="0" width="1140" height="620" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="30" stdDeviation="32" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <rect width="1180" height="620" rx="42" fill="url(#page)"/>
+  <rect width="1180" height="620" rx="42" fill="url(#glow1)"/>
+  <rect width="1180" height="620" rx="42" fill="url(#glow2)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="54" y="36" width="1072" height="548" rx="30" fill="#0C0B0D"/>
+    <rect x="55" y="37" width="1070" height="546" rx="29" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="2"/>
+
+    <rect x="54" y="36" width="1072" height="48" rx="30" fill="#F4F0EA"/>
+    <path d="M54 66C54 49.4315 67.4315 36 84 36H1096C1112.57 36 1126 49.4315 1126 66V84H54V66Z" fill="#F4F0EA"/>
+    <circle cx="89" cy="60" r="9" fill="#FF5F57"/>
+    <circle cx="118" cy="60" r="9" fill="#FFBD2E"/>
+    <circle cx="147" cy="60" r="9" fill="#28C840"/>
+    <text x="186" y="67" fill="#5C5F66" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700">spec3 correction</text>
+
+    <rect x="72" y="102" width="700" height="438" rx="0" fill="url(#video)"/>
+    <rect x="72" y="102" width="700" height="438" fill="url(#glow2)" opacity="0.72"/>
+    <rect x="72.5" y="102.5" width="699" height="437" stroke="#FFFFFF" stroke-opacity="0.09"/>
+
+    <g opacity="0.82">
+      <circle cx="420" cy="302" r="82" fill="#DCECF4" opacity="0.08"/>
+      <path d="M294 312C327 265 370 242 421 242C472 242 515 265 548 312C515 359 472 382 421 382C370 382 327 359 294 312Z" fill="#EAF8FF"/>
+      <circle cx="421" cy="312" r="38" fill="#56D3E9"/>
+      <circle cx="421" cy="312" r="17" fill="#071118"/>
+      <circle cx="406" cy="296" r="9" fill="white" opacity="0.9"/>
+      <path d="M270 312C344 220 498 220 572 312" stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="16" stroke-linecap="round"/>
+      <path d="M270 312C344 404 498 404 572 312" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="16" stroke-linecap="round"/>
+    </g>
+
+    <rect x="792" y="102" width="316" height="438" rx="0" fill="url(#panel)"/>
+    <rect x="792.5" y="102.5" width="315" height="437" stroke="#FFFFFF" stroke-opacity="0.09"/>
+
+    <circle cx="824" cy="134" r="7" fill="#A78BFA"/>
+    <text x="842" y="143" fill="#F6F2ED" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="750">spec3 correction</text>
+    <text x="843" y="166" fill="#AAA2A0" font-family="Inter, Arial, sans-serif" font-size="13">reading stabilization</text>
+    <rect x="1017" y="118" width="66" height="36" rx="7" fill="#A78BFA"/>
+    <text x="1050" y="142" fill="#FFFFFF" font-family="Inter, Arial, sans-serif" font-size="14" font-weight="800" text-anchor="middle">ON</text>
+    <line x1="815" y1="188" x2="1084" y2="188" stroke="#FFFFFF" stroke-opacity="0.12"/>
+
+    <rect x="814" y="210" width="270" height="42" rx="8" fill="#251D20" stroke="#FFFFFF" stroke-opacity="0.12"/>
+    <rect x="814" y="210" width="5" height="42" fill="#BFD8E3"/>
+    <text x="832" y="236" fill="#BDB6B4" font-family="Inter, Arial, sans-serif" font-size="13">Camera</text>
+    <text x="899" y="236" fill="#F4F0EA" font-family="Inter, Arial, sans-serif" font-size="13" font-weight="700">MacBook Pro</text>
+    <text x="1066" y="236" fill="#BDB6B4" font-family="Inter, Arial, sans-serif" font-size="13">v</text>
+
+    <rect x="814" y="268" width="270" height="56" rx="8" fill="#251D20" stroke="#FFFFFF" stroke-opacity="0.12"/>
+    <rect x="814" y="268" width="5" height="56" fill="#FBC26E"/>
+    <text x="832" y="294" fill="#F4F0EA" font-family="Inter, Arial, sans-serif" font-size="15" font-weight="700">Reading detector</text>
+    <text x="1038" y="294" fill="#FBC26E" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="800">LIVE</text>
+    <rect x="832" y="306" width="92" height="5" rx="2.5" fill="#5A4E4D"/>
+    <circle cx="852" cy="308.5" r="4" fill="#BFD8E3"/>
+    <rect x="982" y="306" width="82" height="5" rx="2.5" fill="#5A4E4D"/>
+    <circle cx="1001" cy="308.5" r="4" fill="#BFD8E3"/>
+
+    <g font-family="Inter, Arial, sans-serif">
+      <text x="832" y="352" fill="#E6DFDB" font-size="14">Stabilizer Power</text>
+      <text x="1036" y="352" fill="#BFD8E3" font-size="14">100%</text>
+      <rect x="832" y="366" width="220" height="7" rx="3.5" fill="#5A4E4D"/>
+      <rect x="832" y="366" width="178" height="7" rx="3.5" fill="#BFD8E3"/>
+      <circle cx="1010" cy="369.5" r="11" fill="#F5FBFF" stroke="#BFD8E3" stroke-width="3"/>
+
+      <text x="832" y="398" fill="#E6DFDB" font-size="14">Eye Direction</text>
+      <text x="1036" y="398" fill="#BFD8E3" font-size="14">+12%</text>
+      <rect x="832" y="412" width="220" height="7" rx="3.5" fill="#5A4E4D"/>
+      <rect x="940" y="412" width="44" height="7" rx="3.5" fill="#BFD8E3"/>
+      <circle cx="984" cy="415.5" r="11" fill="#F5FBFF" stroke="#BFD8E3" stroke-width="3"/>
+
+      <text x="832" y="444" fill="#E6DFDB" font-size="14">Reading Hold</text>
+      <text x="1036" y="444" fill="#BFD8E3" font-size="14">90%</text>
+      <rect x="832" y="458" width="220" height="7" rx="3.5" fill="#5A4E4D"/>
+      <rect x="832" y="458" width="198" height="7" rx="3.5" fill="#BFD8E3"/>
+      <circle cx="1030" cy="461.5" r="11" fill="#F5FBFF" stroke="#BFD8E3" stroke-width="3"/>
+    </g>
+
+    <rect x="814" y="488" width="270" height="34" rx="8" fill="#2F292B" stroke="#FFFFFF" stroke-opacity="0.11"/>
+    <text x="834" y="510" fill="#F4F0EA" font-family="Inter, Arial, sans-serif" font-size="14" font-weight="700">Personal AI</text>
+    <text x="1020" y="510" fill="#BFD8E3" font-family="Inter, Arial, sans-serif" font-size="14" font-weight="700">AI 75%</text>
+  </g>
+</svg>

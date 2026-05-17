@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest an improvement for the app experience.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: What should become better?
+      placeholder: I want READ mode to react faster when...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Camera selection
+        - READ detector
+        - Eye rendering
+        - Personal AI training
+        - OBS Bridge / virtual camera
+        - UI / design
+        - Packaging / installation
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposed idea
+      placeholder: Describe the behavior, control, or workflow you want.
+  - type: textarea
+    id: context
+    attributes:
+      label: Extra context
+      placeholder: Add screenshots, examples, or apps with similar behavior.

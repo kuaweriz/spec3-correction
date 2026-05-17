@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a camera, READ detector, rendering, OBS, or app bug.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Clear steps and environment details make camera bugs much easier to fix.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+      placeholder: The preview becomes black after switching from MacBook camera to...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open spec3 correction
+        2. Select camera...
+        3. Press...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Camera selection / black preview
+        - READ detector
+        - Eye rendering
+        - Personal AI training
+        - OBS Bridge / virtual camera
+        - UI / settings
+        - Packaging / launch
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: macOS 15.5
+  - type: input
+    id: camera
+    attributes:
+      label: Camera setup
+      placeholder: MacBook Pro camera, external USB webcam, iPhone Continuity Camera...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste only relevant app logs. Do not include private data.
+      render: text
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshot or recording
+      description: Attach media only if it does not expose private content.

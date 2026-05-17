@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Camera troubleshooting
+    url: https://github.com/kuaweriz/spec3-correction/blob/main/docs/camera_troubleshooting.md
+    about: Check the camera recovery guide before opening a camera bug.
+  - name: Personal AI training guide
+    url: https://github.com/kuaweriz/spec3-correction/blob/main/docs/training.md
+    about: Learn how to record better READ, LIVE, and LOOK samples.
